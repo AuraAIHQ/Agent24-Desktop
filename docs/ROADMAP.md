@@ -51,26 +51,39 @@
 
 ---
 
-## M2（6-8 周）— Agent 永远在线 + 通信
+## M2（6-8 周）— Agent 永远在线 + 通信 + iDoris-SDK 合并
 
 - [ ] Tray icon + 后台 daemon
 - [ ] Conversation Layer：任务分解 + 调度
 - [ ] MCP bridge 接 Agent24 skills
 - [ ] `@auraaihq/module-comm` — agent-speaker bridge
 - [ ] `@auraaihq/module-identity` — AirAccount 集成
-- [ ] iDoris-SDK 接入（作为 `@auraaihq/module-wechat` 复用）
+- [ ] **iDoris-SDK 合并到 monorepo（ADR-013）**
+  - [ ] 代码迁入 `auraai-packages/communication/wechat-bridge/`
+  - [ ] npm 包改名 `@agent-wechat/core` → `@auraaihq/wechat-bridge`
+  - [ ] 老包 deprecate
+  - [ ] simple-agent 升级依赖
+  - [ ] AuraAIHQ/iDoris-SDK 归档
+- [ ] `@auraaihq/module-wechat` 适配模块（包装 wechat-bridge 给 desktop 用）
 - [ ] 第二批 publisher：xiaohongshu / xiaoheishu / wechat-mp / twitter
 
 ---
 
-## M3（8-10 周）— Memory + Evolver
+## M3（8-10 周）— Memory + Evolver + Agent24 替代
 
 - [ ] `@auraaihq/memory` 升级到 L0-L3 完整分层
 - [ ] `@auraaihq/skill-bank` —（SkillRL 风格）
 - [ ] `@auraaihq/evolver` —（SkillClaw 风格守护进程）
 - [ ] ATIF 轨迹采集（Conversation Layer 写入 archive）
 - [ ] Codex 评估作为 validated publish gate
-- [ ] `@auraaihq/skills-*` 包（Claude Code skill 镜像）
+- [ ] **Agent24 → npm 包迁移（ADR-014）**
+  - [ ] `@auraaihq/skills-evolve` / `skills-evaluate` / `skills-setup` / `skills-org-sync`
+  - [ ] `@auraaihq/cli install <skill>` 替代 install.sh
+  - [ ] AuraAIHQ/Agent24 标记为 **deprecated**：仓库 archive 只读 + README 顶部加显眼 deprecated banner 引导到新 npm 包
+- [ ] **Agent24-Desktop 改名为 Agent24（ADR-015）**
+  - [ ] 仓库 rename: AuraAIHQ/Agent24-Desktop → AuraAIHQ/Agent24（旧 Agent24 已归档，名字空出来）
+  - [ ] 应用产品名：去掉 "Desktop" 后缀
+  - [ ] 为未来 mobile 端做准备（Electron + Capacitor 或 Tauri 路径）
 
 ---
 

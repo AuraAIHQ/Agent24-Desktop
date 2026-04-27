@@ -397,6 +397,164 @@ iDoris-SDK (@agent-wechat/core)        ← 协议层 SDK，独立存在
 
 ---
 
+## ADR-013：iDoris-SDK 合并进 auraai-packages monorepo（M2 执行）
+
+**日期**：2026-04-27
+**状态**：✅ 采纳（修正 ADR-012 的回答范围）
+
+### 背景
+
+ADR-012 答的是"iDoris-SDK 合并进 `@auraaihq/sdk` 单个包"——这个不行（不同受众、不同依赖）。
+
+但用户后续问的是另一个问题："iDoris-SDK 合并进 `@auraaihq` scope（即 auraai-packages monorepo）"。这两件事不一样。
+
+### 论证
+
+合并到 monorepo 与合并到单个 SDK 包的区别：
+
+| 维度 | 合并进单个 SDK 包（ADR-012 拒绝）| 合并进 monorepo（本 ADR 接受）|
+|------|------------------------------|---------------------------|
+| 包名 | 强制改名 `@auraaihq/sdk` | 改为 `@auraaihq/wechat-bridge`（独立包）|
+| 受众 | 被迫只服务 desktop 模块开发者 | 仍可服务任何 Agent 作者 |
+| 依赖 | 污染 SDK 依赖树 | 隔离在自己包里 |
+| 与 ADR-007 兼容 | ❌ | ✅（混合 monorepo 设计就支持低耦合包并存）|
+
+合并到 monorepo 实际是 ADR-007 的应用场景——`communication/` 子目录正好对应"低耦合、未来易拆"的扩展模块。
+
+### 决策
+
+**M2 阶段执行**：
+- iDoris-SDK 代码迁入 `auraai-packages/communication/wechat-bridge/`
+- npm 包改名 `@agent-wechat/core` → `@auraaihq/wechat-bridge`
+- 老包 deprecate（保留发布历史，README 指向新包）
+- simple-agent 同步升级依赖
+- AuraAIHQ/iDoris-SDK 仓库归档（README 指向新位置）
+
+**为什么 M2**：M2 时机做 module-wechat 集成，连同协议层一起搬干净，避免来回改。
+
+---
+
+## ADR-014：Agent24 在 M3 后被 @auraaihq/skills-* + skill-bank + evolver 替代
+
+**日期**：2026-04-27
+**状态**：✅ 采纳（M3 执行）
+
+### 背景
+
+用户指出：Agent24 实质是 4 个 SKILL.md + agent-config.yaml + install.sh + 2 个 hook，没有独立运行时。一旦 `@auraaihq/skill-bank` + `@auraaihq/evolver` + `@auraaihq/skills-*` 包落地，Agent24 作为独立 repo 就成了冗余。
+
+### 拆解
+
+| Agent24 当前内容 | M3 后位置 |
+|----------------|----------|
+| `skills/evolve/SKILL.md` | `@auraaihq/skills-evolve` |
+| `skills/evaluate/SKILL.md` | `@auraaihq/skills-evaluate` |
+| `skills/setup/SKILL.md` | `@auraaihq/skills-setup` |
+| `skills/org-sync/SKILL.md` | `@auraaihq/skills-org-sync` |
+| `agent-config.yaml` | `@auraaihq/skills-evolve` 默认 config |
+| `install.sh` | `@auraaihq/cli install <skill>` |
+| `hooks/*.sh` | 各 skill 包自带 |
+
+### Agent24 与 skill-bank/evolver 的关系（修正）
+
+不是"替代"是"承接"：
+- `@auraaihq/skills-*` = 静态内容（初始 skill markdown）
+- `@auraaihq/skill-bank` = 运行时存储+检索容器
+- `@auraaihq/evolver` = 进化引擎，扫 archive 写新 skill 到 skill-bank
+
+Agent24 是 skill-bank 的**初始种子内容**，evolver 是后续填充器。
+
+### 时间表
+
+| 阶段 | Agent24 状态 |
+|------|------------|
+| 当前 ~ M2 | **保留**——唯一可用的实现 |
+| M3（skill-bank + evolver 落地）| **迁移**——4 个 skill 拆为 npm 包 |
+| M3 末 | **Deprecated**——`AuraAIHQ/Agent24` 仓库 archive 为只读，README 显眼标注 deprecated 状态，引导到新 npm 包<br>之后名字空出来给 Agent24-Desktop 改名（见 ADR-015）|
+
+### 为什么不现在做
+
+- skill-bank 和 evolver 当前是 placeholder（M3 才实现）
+- Agent24 是今天唯一能跑的东西，提前迁移会留下一个 M2-M3 的空窗期
+- M3 落地时一起改，避免双轨
+
+### 决策
+
+M3 执行迁移。在那之前 Agent24 保持现状。
+
+---
+
+## ADR-015：M3 后 Agent24-Desktop 改名为 Agent24
+
+**日期**：2026-04-27
+**状态**：✅ 采纳（M3 末执行，依赖 ADR-014 完成）
+
+### 背景
+
+ADR-014 决定 M3 时 Agent24（旧）的内容迁出到 npm 包，老仓库归档。这空出了 "Agent24" 这个名字。
+
+用户提议："Agent24-Desktop 改回 Agent24，这样'Desktop' 后缀去掉。它本来就是一个壳，未来发移动端也合理（mobile + desktop）。"
+
+### 论证
+
+**支持**：
+- "Agent24-Desktop" 这个名字暗示了"仅桌面端"，限制了未来发展方向
+- 框架本质是 Electron 跨平台壳，加 Capacitor 或 Tauri 就能上 mobile（iOS/Android）
+- 与定位"个人 24 小时在线 Agent"匹配——agent 在哪都能用，不限于 desktop
+- 老 Agent24 归档后名字空出来，刚好用上
+- 减少品牌认知割裂（一个产品两个名字）
+
+**潜在问题**：
+- GitHub repo rename 会有一段重定向期，破坏外部 PR / star 关注（但 GitHub 自动 301 重定向，影响可控）
+- 现有文档/链接需要更新
+
+### 时间表
+
+| 阶段 | 状态 |
+|------|------|
+| 当前 ~ M3 中 | `Agent24` 仓库还在用（Skills），`Agent24-Desktop` 同时存在 |
+| M3 末 ADR-014 完成时 | 旧 `AuraAIHQ/Agent24` 归档（README 指向 npm 包）|
+| M3 末紧接着执行 | `AuraAIHQ/Agent24-Desktop` rename → `AuraAIHQ/Agent24` |
+| M4+ | 应用产品名去掉 "Desktop"，为 mobile 端开口 |
+
+### 决策
+
+执行 ADR-015。在 ADR-014 完成后立即做 repo rename。
+
+### 长期路径（M5+ 推测）
+
+Agent24 应用形态可能演化为：
+- Desktop：Electron（mac/win/linux）—— 现在的形态
+- Mobile：Tauri 2.0 mobile / Capacitor + 同一份 React 代码—— 未来路径
+- Web：纯 PWA（最简，但本地能力受限）
+
+不强制要求 M5 实现 mobile，但**架构设计（M0-M3）就要避免 desktop-only 的耦合**——例如不要假设永远有 `node-llama-cpp` 等只在 Node 环境的依赖。
+
+---
+
+## 整合后的生态简化
+
+ADR-013 + ADR-014 落地后，活跃仓库从 7 个降到 3-4 个：
+
+```
+活跃:
+  AuraAIHQ/Agent24-Desktop      ← Electron 应用
+  AuraAIHQ/auraai-packages      ← 单一 monorepo 装：
+                                  - 内核 / SDK / CLI
+                                  - skills-* (从 Agent24 迁入)
+                                  - skill-bank / evolver
+                                  - communication/wechat-bridge (从 iDoris-SDK 迁入)
+                                  - publishers/* / scrapers/* / idoris/*
+  AuraAIHQ/iDoris               ← AI 模型代码（独立技术栈）
+  AuraAIHQ/agent-speaker        ← Nostr 通信（独立 Go 项目，不进 npm 体系）
+
+Deprecated（archive 只读，README 引导到新位置）:
+  AuraAIHQ/Agent24              ← M3 末 deprecated（之后名字让给 Agent24-Desktop rename）
+  AuraAIHQ/iDoris-SDK           ← M2 末 deprecated（content 已迁入 monorepo）
+```
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
@@ -405,3 +563,5 @@ iDoris-SDK (@agent-wechat/core)        ← 协议层 SDK，独立存在
 | 提议把 publishers 收纳进 iDoris-SDK 候选方案前没批驳 | 应该立刻指出职责重叠 |
 | 错过用户已注册 `@auraaihq` 的事实，先建议 `@auraai` | 应该先查 npm 状态 |
 | 一度想把 skill-bank 和 evolver 合并 | 关注点分离原则不应妥协 |
+| ADR-012 答错了问题（把 monorepo 合并和单包合并混为一谈）| 用户复问时才纠正 → ADR-013 |
+| 把 Agent24 描述成"认知架构层"等夸大词 | 用户指出后承认它就是 4 个 markdown 文件 → ADR-014 |

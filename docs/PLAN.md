@@ -300,6 +300,42 @@ M5 (后续) — 生态
 
 ---
 
+## 七.5、生态整合计划（M2 + M3）
+
+详见 ADR-013、ADR-014（[decision.md](decision.md)）。
+
+### M2 阶段：iDoris-SDK 合并到 monorepo
+
+- 代码迁入 `auraai-packages/communication/wechat-bridge/`
+- npm 包：`@agent-wechat/core` → `@auraaihq/wechat-bridge`（老包 deprecate）
+- simple-agent 同步升级
+- `AuraAIHQ/iDoris-SDK` 仓库归档
+
+### M3 阶段：Agent24 替代为 npm 包
+
+- 4 个 SKILL.md 拆为：
+  - `@auraaihq/skills-evolve`
+  - `@auraaihq/skills-evaluate`
+  - `@auraaihq/skills-setup`
+  - `@auraaihq/skills-org-sync`
+- `install.sh` 替代为 `@auraaihq/cli install <skill>`
+- agent-config.yaml 作为 skills-evolve 默认 config
+- hooks 作为各 skill 包自带
+- `AuraAIHQ/Agent24` 仓库标记为 **deprecated**：archive 只读，README 顶部加 deprecated banner 引导到 npm 包
+- M3 末紧接着 `AuraAIHQ/Agent24-Desktop` rename → `AuraAIHQ/Agent24`（详见 ADR-015）
+
+### 整合后生态规模
+
+活跃 repo: 7 → **3-4**
+- AuraAIHQ/Agent24-Desktop (Electron 应用)
+- AuraAIHQ/auraai-packages (npm monorepo)
+- AuraAIHQ/iDoris (AI 模型)
+- AuraAIHQ/agent-speaker (Go 通信，不进 npm)
+
+归档 repo:
+- AuraAIHQ/Agent24
+- AuraAIHQ/iDoris-SDK
+
 ## 八、相关仓库
 
 | 仓库 | 角色 | URL |
