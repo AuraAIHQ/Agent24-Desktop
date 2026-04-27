@@ -347,6 +347,56 @@ M0 阶段**不写接口**，先：
 
 ---
 
+## ADR-012：iDoris-SDK 不合并进 @auraaihq/sdk
+
+**日期**：2026-04-27
+**状态**：✅ 采纳
+
+### 背景
+
+用户问："iDoris-SDK 要不要把它纳入到我的 Agent24-Desktop 这个 SDK 里边呢？换句话说，我们只要 1 个 SDK 就行。"
+
+### 论证
+
+iDoris-SDK 与 `@auraaihq/sdk` 是两个不同维度的"SDK"，受众和职责都不同：
+
+| 维度 | iDoris-SDK | @auraaihq/sdk |
+|------|------------|---------------|
+| 受众 | 任何想把 Agent 接入微信的人 | 开发 Agent24-Desktop 模块的人 |
+| 职责 | WeChat 协议适配（iLink ↔ Agent 接口）| 框架开发者 API（types/hooks）|
+| 依赖 | wechat-agent-bridge（第三方）| 应零运行时依赖 |
+| 场景 | 可独立运行（Mac mini 24/7）| 必须在 desktop 框架内 |
+| Release | 跟随腾讯 iLink 协议（外驱）| 跟随我们框架（内驱）|
+| 现有消费 | simple-agent 已用 `@agent-wechat/core` | 暂无 |
+
+### 合并的代价
+
+1. 破坏 simple-agent 等现有消费方——它们被迫依赖整个 desktop 框架
+2. 绑定第三方依赖——`@auraaihq/sdk` 被迫依赖 wechat-agent-bridge，污染所有 module 开发者的依赖树
+3. 限制 iDoris-SDK 复用范围——本来能服务整个 AuraAI 生态（甚至外部），合并后仅服务 desktop
+
+### 类比
+
+`axios`（HTTP 协议库）vs `@tanstack/react-query`（React 集成层）——不合并。
+- axios 任何 JS 环境都能用
+- react-query 仅 React 应用用
+
+### 决策
+
+**不合并**。iDoris-SDK 保持独立。在 Agent24-Desktop 中的集成路径：
+
+```
+iDoris-SDK (@agent-wechat/core)        ← 协议层 SDK，独立存在
+    ↓ 被使用 by
+@auraaihq/module-wechat                ← 适配模块（"消费者"）
+    ↓ 实现
+@auraaihq/sdk 的 Module 接口            ← 框架 SDK
+```
+
+这样 iDoris-SDK 服务多受众（simple-agent + 我们 + 任何 third party），`@auraaihq/sdk` 保持纯净。
+
+---
+
 ## 附：决策中我（Claude）犯的错误（用于改进）
 
 | 错误 | 教训 |
