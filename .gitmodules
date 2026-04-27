@@ -1,0 +1,3 @@
+[submodule "vendor/xiaoheishu"]
+	path = vendor/xiaoheishu
+	url = https://github.com/MushroomDAO/Xiaoheishu.git
