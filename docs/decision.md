@@ -532,6 +532,113 @@ Agent24 应用形态可能演化为：
 
 ---
 
+## ADR-016：模块安全与权限模型
+
+**日期**：2026-04-27
+**状态**：✅ 采纳（M1 设计模块加载器时落地）
+
+### 背景
+
+之前的 ADR-011 笼统说"模块发现 / 信任 / 权限"，没具体方案。但模块加载器是 M1 的核心交付，没有清晰的安全模型就实现不了。
+
+### 决策（分阶段）
+
+**M1 起步版**：
+- **沙箱**：每个模块跑在独立 Node `worker_thread`（不跨进程，性能/隔离折中）
+- **权限**：模块在 manifest 中声明所需权限（`fs:read`、`fs:write`、`net`、`ai`、`memory:read`、`memory:write`、`module:invoke:<id>`），加载器据此构造受限的 ModuleContext
+- **签名**：跳过——M1 只支持内置模块和明示信任的 npm 包
+- **凭据**：所有 API key / token 经 keytar 存系统 keychain，模块申请时由内核解密注入
+
+**M3 增强版**：
+- **沙箱**：升级到独立子进程（child_process.fork），可单独崩溃恢复
+- **签名**：新模块发布时强制 sigstore 签名，加载时验证
+- **AirAccount 信任根**：用户可设置"只信任此 AirAccount 签发的模块"
+
+**M5 企业版**：
+- 完全 VM 沙箱（webcontainer 风格）+ 流量审计 + 权限运行时审批 UI
+
+### 论证
+
+不一开始上完整方案的原因：模块作者是稀缺资源，过度安全限制会劝退开发者；M1 阶段先让生态长起来。沙箱和签名按"加密圈+模块成熟度"渐进强化。
+
+---
+
+## ADR-017：数据隐私与轨迹共享（Privacy & Trajectory Sharing）
+
+**日期**：2026-04-27
+**状态**：✅ 采纳
+
+### 背景
+
+iDoris 定位"隐私优先"，evolver 又依赖跨用户轨迹做进化。这两个目标必须显式协调。
+
+### 决策
+
+**默认全本地**：
+- 所有 ATIF 轨迹、memory、archive 默认**仅本地存储**（加密 SQLite）
+- 跨设备同步默认关闭，开启后用 NIP-44 端到端加密
+- evolver 默认仅在本机轨迹上运行（个人 SkillBank）
+
+**Skill 共享是 Opt-in**：
+- 用户必须显式开启"contribute to community SkillBank"
+- 开启时也只发送**已 evolver 蒸馏过的 skill**（SKILL.md），不发原始轨迹
+- 蒸馏过程在本地完成，敏感信息（API key、个人数据）按规则脱敏
+- 默认匿名（pubkey 不绑定真实身份），可选公开署名
+
+**iDoris 数据流**：
+- iDoris 调用产生的中间数据**不离开设备**
+- 用户可设置"敏感任务路由"：某些任务类型强制使用 iDoris（不调云端）
+
+### 论证
+
+privacy-first 必须是"安全默认值"，不能默认 share-on（用户不知情下被采集）。SkillClaw 论文中的"集体进化"是 opt-in 加 federated 蒸馏，照搬这个模式。
+
+---
+
+## ADR-018：移动端技术路径选 Tauri 2.0（M5+）
+
+**日期**：2026-04-27
+**状态**：✅ 采纳（影响 M0-M4 的依赖选择）
+
+### 备选
+
+ADR-015 提到将来要做 mobile，需要在三种路径间选：
+- **A. Capacitor + Electron 共代码**：复用现有 Electron 工程，加 Capacitor 包装
+- **B. Tauri 2.0**：原生跨平台（含 mobile），Rust 后端 + Web 前端
+- **C. React Native 重写**：mobile 优先，desktop 用 RN-Windows/macOS
+
+### 论证
+
+| 维度 | Capacitor | Tauri 2.0 | RN |
+|------|-----------|-----------|-----|
+| 现有 Electron 代码复用 | 高 | 中（前端 React 可全留）| 低（重写）|
+| 包大小 | 60-100MB | 8-15MB | 15-30MB |
+| Mobile 性能 | 中 | 高（Rust 后端）| 高（原生 bridge）|
+| Node 生态依赖 | ✅ 全支持 | ❌ 不支持 node-llama-cpp 等 | ❌ |
+| AI/llama.cpp 在 mobile | 受限 | 需 Rust 重写桥接 | 需原生重写 |
+| 学习曲线 | 低 | 中（Rust）| 高 |
+| 长期维护 | Capacitor 团队 | Tauri 团队（活跃）| Meta（活跃）|
+
+### 决策
+
+**Tauri 2.0**。理由：
+- Tauri 2.0 已支持 mobile (iOS + Android)
+- 包大小决定性优势——desktop agent 不能臃肿
+- Rust 后端与 iDoris 未来可能的 Rust 绑定路径一致
+- 前端 React 代码可全部复用
+
+### 影响 M0-M4 的设计约束
+
+为了 M5 能顺利切换：
+- ❌ **避免** Electron-only API（如 `BrowserWindow.webContents` 直接调用）
+- ❌ **避免** Node 原生依赖（除非有 Rust 替代品）
+- ✅ **使用**：HTTP/IPC 抽象层、独立进程通信、可移植的存储 API
+- ✅ AI Layer 设计上预留"Rust binding via Tauri command"接口
+
+M0-M4 仍用 Electron 实现（开发速度快），但模块接口设计要 Tauri-friendly。
+
+---
+
 ## 整合后的生态简化
 
 ADR-013 + ADR-014 落地后，活跃仓库从 7 个降到 3-4 个：
@@ -552,6 +659,27 @@ Deprecated（archive 只读，README 引导到新位置）:
   AuraAIHQ/Agent24              ← M3 末 deprecated（之后名字让给 Agent24-Desktop rename）
   AuraAIHQ/iDoris-SDK           ← M2 末 deprecated（content 已迁入 monorepo）
 ```
+
+---
+
+## 附：开放问题（Open Issues，待 M2-M3 决策）
+
+下面这些是已识别但暂未决策的设计点，列出来防止遗漏。每条会在合适的里程碑上升为 ADR。
+
+| # | 问题 | 何时决策 |
+|---|------|--------|
+| OI-1 | 模块意图冲突（两个 publisher 都想接管 "send tweet"）→ 用户优先 / 显式声明 / dispatcher 投票？ | M1（dispatcher 设计时）|
+| OI-2 | 模块版本冲突（A 依赖 `core@^1.0`，B 依赖 `core@^2.0`）解决策略 | M1 |
+| OI-3 | API 调用配额（Claude / OpenAI 月度上限）UI 展示 + 警告 + 自动降级到 iDoris/Local | M2 |
+| OI-4 | 首次启动 onboarding 流程（默认装哪些模块？引导用户做什么？）| M2 末 |
+| OI-5 | 模块更新/回滚机制（auto-update / 通知后手动 / staged rollout）| M2 |
+| OI-6 | 模块市场经济模型（如有）：纯免费？付费模块？打赏？| M4+ |
+| OI-7 | 多账号支持（同一台机器多个用户身份）| M3+ |
+| OI-8 | i18n（UI 中英双语）| M3 末 |
+| OI-9 | 自动化测试体系（unit / module integration / e2e）| M1 |
+| OI-10 | telemetry / 错误上报（opt-in，匿名化，告警关键 bug）| M2 |
+| OI-11 | 模型能力路由表（vision 任务用 LLaVA，长文本用 Claude，本地隐私用 iDoris）| M2 |
+| OI-12 | 备份与恢复（用户 memory + config 整体备份/迁移到新设备）| M3 |
 
 ---
 
