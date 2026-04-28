@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "description": "Cross-platform Electron framework for Agent24 — pluggable capability modules + AI layer + memory + agent communication",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "main": "dist/main/main.js",
   "engines": {
     "node": ">=22"
@@ -24,6 +24,9 @@
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\""
   },
   "dependencies": {
+    "@auraaihq/core": "file:/Users/jason/Dev/auraai/auraai-packages/packages/core",
+    "@auraaihq/memory": "file:/Users/jason/Dev/auraai/auraai-packages/packages/memory",
+    "@auraaihq/sdk": "file:/Users/jason/Dev/auraai/auraai-packages/packages/sdk",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
