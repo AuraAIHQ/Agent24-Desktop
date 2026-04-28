@@ -11,6 +11,18 @@ const api = {
   getAppVersion: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppVersion),
   // Opens a URL in the system browser. Rejects non-http(s) URLs in main.
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
+  // Kernel module management (M1 Task 10).
+  kernel: {
+    listModules: (): Promise<{ id: string; state: string }[]> =>
+      ipcRenderer.invoke(IpcChannels.KernelListModules),
+    loadModule: (id: string): Promise<unknown> =>
+      ipcRenderer.invoke(IpcChannels.KernelLoadModule, id),
+    invoke: (
+      id: string,
+      intent: { kind: string; payload: unknown },
+    ): Promise<unknown> =>
+      ipcRenderer.invoke(IpcChannels.KernelInvoke, id, intent),
+  },
 } as const
 
 contextBridge.exposeInMainWorld('agent24', api)

@@ -3,6 +3,7 @@
 
 import { app, ipcMain, shell } from 'electron'
 import { IpcChannels } from '../../shared/ipc-types'
+import { registerKernelHandlers } from './kernel-handlers'
 
 // Allowlist of URL prefixes permitted for shell.openExternal. Anything
 // not matching is rejected silently — prevents IPC injection opening
@@ -19,4 +20,7 @@ export function registerIpcHandlers(): void {
       void shell.openExternal(url)
     }
   })
+
+  // Kernel module management (M1 Task 10).
+  registerKernelHandlers()
 }

@@ -4,6 +4,7 @@
 import { app, BrowserWindow, session } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
+import { initKernel, getKernel } from './kernel'
 
 const isDev = process.env.NODE_ENV === 'development'
 
@@ -54,6 +55,7 @@ app.whenReady().then(() => {
     })
   })
 
+  initKernel()
   registerIpcHandlers()
   createMainWindow()
 
@@ -66,4 +68,8 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', () => {
+  void getKernel().shutdown()
 })
