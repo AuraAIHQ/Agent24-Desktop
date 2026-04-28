@@ -3,11 +3,14 @@
 // contextBridge. Capability modules will extend this surface in M1+.
 
 import { contextBridge, ipcRenderer } from 'electron'
+import { IpcChannels } from '../shared/ipc-types'
 
 const api = {
   // Placeholder API — M1 will replace with real module-aware surface.
-  ping: (): Promise<string> => ipcRenderer.invoke('app:ping'),
-  getAppVersion: (): Promise<string> => ipcRenderer.invoke('app:version'),
+  ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
+  getAppVersion: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppVersion),
+  // Opens a URL in the system browser. Rejects non-http(s) URLs in main.
+  openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
 } as const
 
 contextBridge.exposeInMainWorld('agent24', api)

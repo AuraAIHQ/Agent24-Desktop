@@ -40,7 +40,15 @@ export function App(): JSX.Element {
           <p>M1 scaffolding. Capability modules and full UI arrive in M1+.</p>
           <p className="hint">
             See{' '}
-            <a href="https://github.com/AuraAIHQ/Agent24-Desktop/blob/main/docs/ROADMAP.md">
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault()
+                void window.agent24.openExternal(
+                  'https://github.com/AuraAIHQ/Agent24-Desktop/blob/main/docs/ROADMAP.md',
+                )
+              }}
+            >
               ROADMAP
             </a>{' '}
             for next milestones.

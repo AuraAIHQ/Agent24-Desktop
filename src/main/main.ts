@@ -1,7 +1,7 @@
 // Agent24-Desktop main process entry — M1 scaffolding.
 // Capability modules will register IPC handlers via the loader (M1 next tasks).
 
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, session } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 
@@ -34,6 +34,26 @@ function createMainWindow(): BrowserWindow {
 }
 
 app.whenReady().then(() => {
+  // Enforce a strict Content-Security-Policy. 'unsafe-inline' on style-src
+  // is required for React's inline styles; remove if switching to CSS modules.
+  // M2 will tighten this further (no 'unsafe-inline' on style-src) once the
+  // full UI design is settled.
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [
+          "default-src 'self'; " +
+          "script-src 'self'; " +
+          "style-src 'self' 'unsafe-inline'; " +
+          "img-src 'self' data:; " +
+          "connect-src 'self'; " +
+          "font-src 'self'",
+        ],
+      },
+    })
+  })
+
   registerIpcHandlers()
   createMainWindow()
 
