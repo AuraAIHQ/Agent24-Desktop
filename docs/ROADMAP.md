@@ -51,13 +51,19 @@
 
 ---
 
-## M2（6-8 周）— Agent 永远在线 + 通信 + iDoris-SDK 合并
+## M2（6-8 周）— Agent 永远在线 + 通信 + iDoris-SDK 合并 + 模块管理 UI
 
 - [ ] Tray icon + 后台 daemon
 - [ ] Conversation Layer：任务分解 + 调度
 - [ ] MCP bridge 接 Agent24 skills
 - [ ] `@auraaihq/module-comm` — agent-speaker bridge
 - [ ] `@auraaihq/module-identity` — AirAccount 集成
+- [ ] **模块管理 UI（新增，详见 PLAN 七.6）**
+  - [ ] Desktop main process: 暴露 `ModuleManagerAPI`（list / enable / disable / getDetails）
+  - [ ] preload bridge 暴露给 renderer
+  - [ ] Renderer: 模块列表面板 + toggle 启停
+  - [ ] toggle on → `kernel.load(id)` / toggle off → `kernel.unload(id)`
+  - [ ] 显示模块 manifest（version / permissions / lifecycle）
 - [ ] **iDoris-SDK 合并到 monorepo（ADR-013）**
   - [ ] 代码迁入 `auraai-packages/communication/wechat-bridge/`
   - [ ] npm 包改名 `@agent-wechat/core` → `@auraaihq/wechat-bridge`
@@ -87,20 +93,38 @@
 
 ---
 
-## M4（10-12 周）— 自进化 + 共享
+## M3 中后期补充（接续 M2 模块管理 UI）
+
+- [ ] **模块装/卸载流程**（PLAN 七.6 阶段 3）
+  - [ ] Desktop 加 npm install runner（独立 child process）
+  - [ ] `ModuleManagerAPI.install(packageName)` / `uninstall(id)`
+  - [ ] 安装后自动 register 到 kernel + UI 即时反映
+  - [ ] 失败回滚 + UI 错误提示
+
+---
+
+## M4（10-12 周）— 自进化 + 共享 + Marketplace
 
 - [ ] 跨用户 skill 共享（用户自愿，匿名 trajectory）
 - [ ] Nostr 分发 skill 更新
 - [ ] iDoris 主 AI 接入（替换 placeholder）
-- [ ] 模块市场 UI（用户从 desktop 装/卸 npm 模块）
+- [ ] **模块 Marketplace（PLAN 七.6 阶段 4）**
+  - [ ] 模块发现服务（Nostr 索引或 npm scope 扫描）
+  - [ ] Desktop UI: marketplace 浏览面板（搜索 + 过滤）
+  - [ ] 一键 install 流程
+  - [ ] 信任分层显示：官方 / 社区 / 第三方 + 权限申请确认
 
 ---
 
 ## M5（后续）
 
-- [ ] 模块签名 + AirAccount 信任根
+- [ ] **模块签名 + AirAccount 信任根**（ADR-016 阶段 3）
+  - [ ] 模块发布需 sigstore 签名
+  - [ ] Marketplace 显示信任级别
+  - [ ] 用户可设置"只信任 AirAccount X 签发的模块"
 - [ ] 跨设备记忆同步
 - [ ] 个人 ↔ 组织 ↔ 公共 三级 agent 网络
+- [ ] Tauri 2.0 mobile 端（ADR-018）
 - [ ] 拆分时机评估（哪些子目录适合拆出 monorepo）
 
 ---

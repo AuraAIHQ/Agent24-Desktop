@@ -336,6 +336,125 @@ M5 (后续) — 生态
 - AuraAIHQ/Agent24
 - AuraAIHQ/iDoris-SDK
 
+---
+
+## 七.6、三方贡献 + UI 启停愿景
+
+最终形态——**用户在 Desktop UI 看到模块清单，逐个 toggle 启停；任何符合 SDK 标准的第三方包都能出现在这里**。
+
+### 核心 Loop
+
+```
+┌────────── 用户面 ──────────┐
+│  Agent24-Desktop UI        │   ← 模块管理面板
+│  ┌───────────────────────┐ │
+│  │ ☑ identity   (启用)   │ │
+│  │ ☑ wallet     (启用)   │ │   ← toggle on/off
+│  │ ☐ publish-twitter     │ │      ↓
+│  │ ☑ publish-blog        │ │   调内核 load() / unload()
+│  │ ⊕ Browse marketplace  │ │      ↓
+│  └───────────────────────┘ │   M4 后：可从 marketplace install
+└──────────────┬─────────────┘
+               │
+       ┌───────▼────────┐
+       │ @auraaihq/core │       ← 内核（已建，PR #6）
+       │  - 注册 / 加载 │          - kernel.register()
+       │  - 卸载 / 路由  │          - kernel.load(id) / unload(id)
+       │  - 沙箱 / 权限  │          - 加载时 sdkVersion 校验
+       └───────┬────────┘
+               │ 任何实现 SDK 接口的包都能加载
+   ┌───────────┴──────────────────────┐
+   │     @auraaihq/sdk 公共契约 (PR #5) │   ← 第三方实现这个接口即可
+   │  Module / ModuleManifest /        │
+   │  Intent / Permission / Result     │
+   └───────────┬──────────────────────┘
+               │
+   ┌───────────┴────────────┬─────────────┬──────────────┐
+   ▼                        ▼             ▼              ▼
+预设官方模块               社区贡献       第三方付费       本地实验
+@auraaihq/module-*        @community/*    @vendor/*       npm link
+@auraaihq/publish-*       @x/cool-tool                    file:./...
+@auraaihq/scrape-*
+@auraaihq/idoris-*
+```
+
+### 实现路线（三步走）
+
+| 阶段 | 用户能做 | 技术建设 |
+|------|---------|---------|
+| **M1**（当前）| 没有 UI，开发者 npm install 后通过 main process 代码 register | ✅ SDK 契约 + 内核加载器 完成（PR #5、#6） |
+| **M2** 模块管理 UI | 看到已 install 的模块列表 + toggle 启停 | Desktop 加 module manager UI（React 组件 + IPC bridge）；toggle 调 `kernel.load(id)` / `kernel.unload(id)` |
+| **M3** 装/卸载流程 | UI 后台 `pnpm add @auraaihq/publish-twitter` 安装包 | Desktop 加 npm install runner（独立 child process）+ 重启 kernel reload |
+| **M4** Marketplace | 浏览社区/第三方模块，一键 install | 模块发现服务（Nostr 索引或 npm scope 扫描）+ 信任校验（ADR-016：签名）|
+
+### M2 模块管理 UI 设计要点
+
+```ts
+// Desktop main process 暴露给 renderer 的 API（preload bridge）
+interface ModuleManagerAPI {
+  list(): Promise<ModuleListItem[]>          // 已 install 列表
+  enable(id: string): Promise<void>          // = kernel.load(id)
+  disable(id: string): Promise<void>         // = kernel.unload(id)
+  getDetails(id: string): Promise<ModuleDetails>  // manifest + 权限说明
+  // M3+
+  install(packageName: string): Promise<void>
+  uninstall(id: string): Promise<void>
+  // M4+
+  searchMarketplace(query: string): Promise<MarketplaceResult[]>
+}
+
+interface ModuleListItem {
+  id: string
+  name: string
+  version: string
+  state: 'enabled' | 'disabled' | 'failed'
+  permissions: Permission[]   // 用户启用前需确认这些权限
+  lifecycle: ModuleLifecycle
+}
+```
+
+### 三方贡献者的体验（最终形态）
+
+```bash
+# 1. clone + 写一个新模块
+npm init @auraaihq/module my-cool-feature
+# 脚手架生成 src/index.ts implementing Module interface
+
+# 2. 本地测试
+pnpm link --global              # 或 npm link
+# 然后在 Desktop UI 里看到（M3 加 file:// 模块发现）
+
+# 3. 发布到 npm
+pnpm changeset add
+pnpm publish
+
+# 4. 其他用户安装
+# 在他们的 Desktop UI marketplace 里搜索 → 一键 install
+```
+
+### 关键决策记录
+
+- **预设模块 = 我们维护的标杆参考实现**：identity/wallet/comm/storage 这些"基础"模块由我们维护，作为 SDK 怎么用的范例
+- **社区贡献门槛 = 实现 SDK 契约 + 通过 npm scope 命名规则 + 自描述 manifest**：不需要审批，发到 npm 就能用
+- **信任分层（M3+）**：
+  - 官方 `@auraaihq/*` 默认信任
+  - 社区 `@community/*` 提示但不阻拦
+  - 第三方 `@anyone/*` 显式授权 + 显示权限申请
+- **关闭 ≠ 卸载**：toggle off 调 `kernel.unload(id)`，模块 npm 包仍在；卸载是 M3 后单独操作
+
+### 与现有架构的契合
+
+我们已经在 PR #5 (sdk) 和 PR #6 (core) 里把基础打牢：
+- ✅ `Module<TIntent>` 接口存在
+- ✅ `ModuleManifest.intents` / `lifecycle` / `sdkVersion` 字段已定
+- ✅ `Permission` 枚举确定（M2 加 `module:invoke:{id}` runtime check）
+- ✅ Kernel 的 `register / load / unload / list` 完整
+- ✅ `assertNoDuplicateIds` / sandbox 准备 / 权限路由 都齐
+
+**M2 只需要做 UI 这层 + main↔renderer IPC bridge。基础设施 done。**
+
+---
+
 ## 八、相关仓库
 
 | 仓库 | 角色 | URL |
