@@ -6,6 +6,10 @@
 #      (a Personal Access Token with repo scope from an org admin account)
 #   2. The CLA text lives at:
 #      https://github.com/AAStarCommunity/Brood/blob/main/protocol/CLA.md
+#
+# Security note: this workflow runs in the base-repo context (pull_request_target)
+# but does NOT checkout PR branch code, so contributor code never executes here
+# and secrets are not exposed to external contributors.
 
 name: CLA Assistant
 
@@ -16,17 +20,16 @@ on:
     types: [opened, closed, synchronize]
 
 permissions:
-  actions: write
-  contents: write
-  pull-requests: write
-  statuses: write
+  contents: write      # write signatures/cla.json to cla-signatures branch
+  pull-requests: write # post CLA comment on PR
+  statuses: write      # update PR commit status
 
 jobs:
   cla-check:
     runs-on: ubuntu-latest
     steps:
       - name: CLA Assistant
-        uses: contributor-assistant/github-action@v2.6.1
+        uses: contributor-assistant/github-action@da973ddbc33e5ca4e8f63870a623ea5fb2697f3  # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_TOKEN }}
