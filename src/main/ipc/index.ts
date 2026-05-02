@@ -16,7 +16,7 @@ export function registerIpcHandlers(): void {
     if (typeof url !== 'string') return
     const allowed = EXTERNAL_URL_ALLOWLIST.some((prefix) => url.startsWith(prefix))
     if (allowed) {
-      void shell.openExternal(url)
+      shell.openExternal(url).catch((err) => console.error('openExternal failed', err))
     }
   })
 }

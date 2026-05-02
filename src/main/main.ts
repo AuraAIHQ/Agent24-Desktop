@@ -33,6 +33,13 @@ function createMainWindow(): BrowserWindow {
   return win
 }
 
+process.on('uncaughtException', (err) => {
+  console.error('[main] uncaughtException', err)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('[main] unhandledRejection', reason)
+})
+
 app.whenReady().then(() => {
   // Enforce a strict Content-Security-Policy. 'unsafe-inline' on style-src
   // is required for React's inline styles; remove if switching to CSS modules.
@@ -47,7 +54,7 @@ app.whenReady().then(() => {
           "script-src 'self'; " +
           "style-src 'self' 'unsafe-inline'; " +
           "img-src 'self' data:; " +
-          "connect-src 'self'; " +
+          "connect-src 'self'" + (isDev ? " ws://localhost:5173" : "") + "; " +
           "font-src 'self'",
         ],
       },
