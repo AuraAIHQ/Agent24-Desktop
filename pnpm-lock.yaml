@@ -9,13 +9,13 @@ importers:
   .:
     dependencies:
       '@auraaihq/core':
-        specifier: file:/Users/jason/Dev/auraai/auraai-packages/packages/core
-        version: file:../auraai-packages/packages/core
+        specifier: file:../auraai-packages/packages/core
+        version: file:../auraai-packages/packages/core(@auraaihq/memory@file:../auraai-packages/packages/memory)(@auraaihq/sdk@file:../auraai-packages/packages/sdk)
       '@auraaihq/memory':
-        specifier: file:/Users/jason/Dev/auraai/auraai-packages/packages/memory
+        specifier: file:../auraai-packages/packages/memory
         version: file:../auraai-packages/packages/memory
       '@auraaihq/sdk':
-        specifier: file:/Users/jason/Dev/auraai/auraai-packages/packages/sdk
+        specifier: file:../auraai-packages/packages/sdk
         version: file:../auraai-packages/packages/sdk
       react:
         specifier: ^18.3.1
@@ -81,6 +81,9 @@ packages:
   '@auraaihq/core@file:../auraai-packages/packages/core':
     resolution: {directory: ../auraai-packages/packages/core, type: directory}
     engines: {node: '>=22'}
+    peerDependencies:
+      '@auraaihq/memory': workspace:*
+      '@auraaihq/sdk': workspace:*
 
   '@auraaihq/memory@file:../auraai-packages/packages/memory':
     resolution: {directory: ../auraai-packages/packages/memory, type: directory}
@@ -2606,7 +2609,10 @@ snapshots:
 
   7zip-bin@5.2.0: {}
 
-  '@auraaihq/core@file:../auraai-packages/packages/core': {}
+  '@auraaihq/core@file:../auraai-packages/packages/core(@auraaihq/memory@file:../auraai-packages/packages/memory)(@auraaihq/sdk@file:../auraai-packages/packages/sdk)':
+    dependencies:
+      '@auraaihq/memory': file:../auraai-packages/packages/memory
+      '@auraaihq/sdk': file:../auraai-packages/packages/sdk
 
   '@auraaihq/memory@file:../auraai-packages/packages/memory':
     dependencies:

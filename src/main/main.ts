@@ -1,7 +1,7 @@
 // Agent24-Desktop main process entry — M1 scaffolding.
 // Capability modules will register IPC handlers via the loader (M1 next tasks).
 
-import { app, BrowserWindow, session } from 'electron'
+import { app, BrowserWindow, dialog, session } from 'electron'
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { initKernel, getKernel } from './kernel'
@@ -48,7 +48,7 @@ app.whenReady().then(() => {
           "script-src 'self'; " +
           "style-src 'self' 'unsafe-inline'; " +
           "img-src 'self' data:; " +
-          "connect-src 'self'; " +
+          "connect-src 'self'" + (isDev ? " ws://localhost:5173" : "") + "; " +
           "font-src 'self'",
         ],
       },
@@ -64,6 +64,9 @@ app.whenReady().then(() => {
       createMainWindow()
     }
   })
+}).catch((err: Error) => {
+  dialog.showErrorBox('Agent24 Startup Error', err.message)
+  app.quit()
 })
 
 app.on('window-all-closed', () => {
@@ -71,5 +74,9 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  void getKernel().shutdown()
+  try {
+    void getKernel().shutdown()
+  } catch {
+    // kernel was never initialised — nothing to shut down
+  }
 })
