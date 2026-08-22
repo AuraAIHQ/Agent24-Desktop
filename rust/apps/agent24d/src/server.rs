@@ -688,18 +688,42 @@ pub async fn serve(
     // have, then deciding what to build, means a switched-off module is never
     // constructed at all — which is exactly what a user reaching for `disable`
     // needs.
-    let catalogue = vec![crate::domain::Installed {
-        name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
-        version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
-        // A CLOSURE, not a constructed module: the mounter decides whether this
-        // ever runs. That is what lets a user switch off a domain OS whose
-        // constructor is the thing breaking the daemon.
-        build: Box::new(move || {
-            agent24_sin90_os::Sin90Module::new(mode.clone())
-                .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
-                .map_err(|e| e.to_string())
-        }),
-    }];
+    let cos72_mode = if ephemeral {
+        agent24_cos72_os::StorageMode::Memory
+    } else {
+        agent24_cos72_os::StorageMode::Persistent
+    };
+    let catalogue = vec![
+        crate::domain::Installed {
+            name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
+            version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
+            // A CLOSURE, not a constructed module: the mounter decides whether this
+            // ever runs. That is what lets a user switch off a domain OS whose
+            // constructor is the thing breaking the daemon.
+            build: Box::new(move || {
+                agent24_sin90_os::Sin90Module::new(mode.clone())
+                    .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
+                    .map_err(|e| e.to_string())
+            }),
+        },
+        // ME-4. Adding a second domain OS is one more entry — no kernel branch,
+        // no route, no state field. That is the claim ADR-029 makes, and until
+        // there were two of them it was only a claim.
+        //
+        // Cos72 ships ENABLED like Sin90, because `os.json`'s default is
+        // enable-and-let-the-user-say-no; `agent24 os disable cos72` is one
+        // command. Shipping it disabled would have meant nobody ever exercised the
+        // two-module path.
+        crate::domain::Installed {
+            name: agent24_cos72_os::MANIFEST_NAME.to_owned(),
+            version: agent24_cos72_os::MANIFEST_VERSION.to_owned(),
+            build: Box::new(move || {
+                agent24_cos72_os::Cos72Module::new(cos72_mode.clone())
+                    .map(|m| StdArc::new(m) as StdArc<dyn agent24_domain::DomainModule>)
+                    .map_err(|e| e.to_string())
+            }),
+        },
+    ];
     let os_config_path =
         crate::os_config::config_path().ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let os_config = crate::os_config::OsConfig::load(&os_config_path);

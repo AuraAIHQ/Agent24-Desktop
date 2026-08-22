@@ -1266,6 +1266,244 @@ mod tests {
         assert!(rx.try_recv().is_err(), "and nothing reached the hub");
     }
 
+    // ---------- ME-4: two REAL domain OSes ----------
+    //
+    // Everything above mounts FAKE modules, deliberately — a mounter that
+    // special-cased Sin90 would pass those. These use the actual
+    // `agent24-sin90-os` and `agent24-cos72-os` crates, because the question here
+    // is the opposite one: does the kernel have a Sin90-shaped assumption left in
+    // it that a stand-in would not trip?
+
+    /// The two OSes this build ships, assembled the way `serve` assembles them.
+    fn real_catalogue() -> Vec<Installed> {
+        vec![
+            Installed {
+                name: agent24_sin90_os::MANIFEST_NAME.to_owned(),
+                version: agent24_sin90_os::MANIFEST_VERSION.to_owned(),
+                build: Box::new(|| {
+                    agent24_sin90_os::Sin90Module::new(agent24_sin90_os::StorageMode::Persistent {
+                        legacy: None,
+                    })
+                    .map(|m| Arc::new(m) as Arc<dyn DomainModule>)
+                    .map_err(|e| e.to_string())
+                }),
+            },
+            Installed {
+                name: agent24_cos72_os::MANIFEST_NAME.to_owned(),
+                version: agent24_cos72_os::MANIFEST_VERSION.to_owned(),
+                build: Box::new(|| {
+                    agent24_cos72_os::Cos72Module::new(agent24_cos72_os::StorageMode::Persistent)
+                        .map(|m| Arc::new(m) as Arc<dyn DomainModule>)
+                        .map_err(|e| e.to_string())
+                }),
+            },
+        ]
+    }
+
+    async fn post(
+        app: &Router,
+        uri: &str,
+        body: serde_json::Value,
+        token: &str,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn authed_get(app: &Router, uri: &str, token: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_os_writes_only_to_its_own_database() {
+        // THE isolation question, answered at the filesystem rather than by
+        // convention: two domain OSes on one kernel, each writing through its own
+        // HTTP surface, and neither one's data reachable through the other.
+        let tmp = tempfile::tempdir().unwrap();
+        let st = crate::server::tests::state().await;
+        let token = st.token.to_string();
+        let (modules, reports) = mount_all(
+            &real_catalogue(),
+            tmp.path(),
+            &st.events,
+            Ok(&all_enabled()),
+            &no_models(),
+        )
+        .await;
+        assert!(
+            reports.iter().all(|r| r.outcome == MountOutcome::Mounted),
+            "{reports:?}"
+        );
+        let app = crate::server::build_router_with_modules(st, modules);
+
+        // Write through each module's own routes.
+        let r = post(
+            &app,
+            "/api/v1/sin90/directions",
+            serde_json::json!({"title": "sin90 only", "target_window": "2026-Q3"}),
+            &token,
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let r = post(
+            &app,
+            "/api/v1/cos72/entries",
+            serde_json::json!({"text": "cos72 only"}),
+            &token,
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+
+        // Separate DIRECTORIES, derived from each manifest's name...
+        assert!(tmp.path().join("sin90/sin90.db").exists());
+        assert!(tmp.path().join("cos72/cos72.db").exists());
+        assert!(
+            !tmp.path().join("sin90/cos72.db").exists()
+                && !tmp.path().join("cos72/sin90.db").exists(),
+            "neither module may put a database in the other's directory"
+        );
+
+        // ...and neither one's data is visible through the other's surface. This is
+        // the part a shared store would break.
+        let dirs = body_json(authed_get(&app, "/api/v1/sin90/directions", &token).await).await;
+        assert_eq!(dirs["directions"].as_array().unwrap().len(), 1);
+        let entries = body_json(authed_get(&app, "/api/v1/cos72/entries", &token).await).await;
+        assert_eq!(entries["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(entries["entries"][0]["text"], "cos72 only");
+
+        // And the surfaces do not bleed: Cos72's route does not exist under Sin90.
+        assert_eq!(
+            authed_get(&app, "/api/v1/sin90/entries", &token)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_one_off_leaves_the_other_untouched() {
+        // The ME-4 acceptance in one test: disable Sin90, and Cos72 keeps serving
+        // — no shared state, no shared router, no shared store. With one module
+        // this could not have been checked at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let st = crate::server::tests::state().await;
+        let token = st.token.to_string();
+        let cfg = config_from(r#"{"domainOs": {"sin90": {"enabled": false}}}"#);
+        let (modules, reports) = mount_all(
+            &real_catalogue(),
+            tmp.path(),
+            &st.events,
+            Ok(&cfg),
+            &no_models(),
+        )
+        .await;
+        assert_eq!(reports[0].outcome, MountOutcome::Disabled);
+        assert_eq!(
+            reports[1].outcome,
+            MountOutcome::Mounted,
+            "disabling one OS must not disturb the other: {:?}",
+            reports[1]
+        );
+        let app = crate::server::build_router_with_modules(st, modules);
+
+        // Sin90 says it is off, in the way that tells the user WHY.
+        let r = authed_get(&app, "/api/v1/sin90/directions", &token).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(r).await["error"]["code"], "module_disabled");
+        // Cos72 is completely unaffected, including its writes.
+        assert_eq!(
+            post(
+                &app,
+                "/api/v1/cos72/entries",
+                serde_json::json!({"text": "still working"}),
+                &token
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        // And a disabled module leaves no store behind.
+        assert!(!tmp.path().join("sin90").exists());
+        assert!(tmp.path().join("cos72/cos72.db").exists());
+    }
+
+    #[tokio::test]
+    async fn each_os_stamps_its_own_name_on_its_events() {
+        // The kernel relays both without understanding either, so the ONLY thing
+        // keeping their event streams apart is that each sink is built from its
+        // own manifest. Two modules is the first time that can actually be wrong.
+        let tmp = tempfile::tempdir().unwrap();
+        let st = crate::server::tests::state().await;
+        let token = st.token.to_string();
+        let mut rx = st.events.subscribe();
+        let (modules, _) = mount_all(
+            &real_catalogue(),
+            tmp.path(),
+            &st.events,
+            Ok(&all_enabled()),
+            &no_models(),
+        )
+        .await;
+        let app = crate::server::build_router_with_modules(st, modules);
+
+        post(
+            &app,
+            "/api/v1/sin90/directions",
+            serde_json::json!({"title": "d", "target_window": "2026-Q3"}),
+            &token,
+        )
+        .await;
+        post(
+            &app,
+            "/api/v1/cos72/entries",
+            serde_json::json!({"text": "e"}),
+            &token,
+        )
+        .await;
+
+        let mut seen = Vec::new();
+        while let Ok((_, body)) = rx.try_recv() {
+            if let EventBody::Module(m) = body {
+                seen.push((m.module, m.kind));
+            }
+        }
+        assert!(
+            seen.contains(&("sin90".to_owned(), "direction.created".to_owned())),
+            "{seen:?}"
+        );
+        assert!(
+            seen.contains(&("cos72".to_owned(), "entry.created".to_owned())),
+            "{seen:?}"
+        );
+        // Neither appears under the other's name — the failure a shared or
+        // caller-named sink would produce.
+        assert!(
+            !seen
+                .iter()
+                .any(|(m, k)| m == "sin90" && k.starts_with("entry")),
+            "{seen:?}"
+        );
+    }
+
     // ---------- ME-2: the registry ----------
 
     fn config_from(json: &str) -> crate::os_config::OsConfig {

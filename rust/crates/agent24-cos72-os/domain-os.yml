@@ -1,0 +1,16 @@
+# Cos72's domain-OS manifest (ADR-029 / SPEC-MD-ME §2).
+#
+# Identical in SHAPE to Sin90's, which is the point: the kernel reads both the
+# same way and derives routes, data directory and event module from `name`
+# alone. Nothing here is Cos72-specific machinery — if it were, the boundary
+# would not be a boundary.
+name: cos72
+version: "0.1.0"
+route_namespace: /api/v1/cos72
+event_module: cos72
+data_dir: ~/.agent24/os/cos72/
+requires_models: []
+requires_apis: []
+requires_deps: []
+kernel_capabilities: [events]
+impl_kind: in_process_crate
