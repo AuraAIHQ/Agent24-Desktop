@@ -248,12 +248,12 @@ _a24/memory/scoped/{remember,recall,recent}    ← 租约必填；租约无效 =
    > 本轮**可以**验的那半:旧 manifest 的 `memory` 只被解析/映射成 `memory.private` entitlement。**不可以**验的那半(需要 `新 daemon 支持 scoped` + `有效租约`,两条都是 deferred 的生产路径)随门 4 一起标 F8c/F9。
 
 6. **manifest / capability schema 本身要有版本与兼容规则——`initialize` 的版本协商救不了它。** 这条是门 5 的前提,漏了门 5 就落不了地:
-   > `DomainOsManifest` 今天是**顶层 `deny_unknown_fields` + 严格 capability 枚举**（`rust/crates/agent24-domain/src/lib.rs`）。所以将来一个写了 `memory.scoped` 的新 manifest,碰上老 daemon 会在**解析期**就失败——**早于 spawn、早于 `initialize`**。握手期的版本协商发生得太晚,根本轮不到它。
+   > 解析 `domain-os.yml` 的是一个**私有的 `RawManifest`**，它是**唯一** derive `Deserialize` 的 manifest 类型（这样调用方没法直接反序列化成已验证的类型来跳过校验），带**顶层 `deny_unknown_fields`**；`DomainOsManifest` 是**已验证**的那个，**连 `Deserialize` 都没有**。加上严格的 capability 枚举（`rust/crates/agent24-domain/src/lib.rs`）。所以将来一个写了 `memory.scoped` 的新 manifest,碰上老 daemon 会在**解析期**就失败——**早于 spawn、早于 `initialize`**。握手期的版本协商发生得太晚,根本轮不到它。
    >
    > **定死如下,不是「要定」**:
    >
    > - manifest 新增 **`manifest_version: u32`**（schema 自身的版本，与协议版本分开）与可选 **`min_daemon_protocol: u32`**。**`manifest_version` 必须是*可选带默认*，不是必填**——今天所有 manifest 都没有这个字段，设成必填会让现存的每一份当场解析失败。**缺失 = v1**；今天的 schema 就是 **v1**，今天的回调协议是 **1**。
-   > - 解析**分两步**：先用一个**宽容的**「信封」结构只读 `manifest_version` / `min_daemon_protocol` / `name`（这一层**不能** `deny_unknown_fields`，否则第一步就死了）；再按版本选严格结构做第二步解析。
+   > - 解析**分两步**，**两步都在 `RawManifest` 这一侧，不是在 `DomainOsManifest` 上**（照着改的人要动的是前者）：先用一个**宽容的**「信封」结构只读 `manifest_version` / `min_daemon_protocol` / `name`（这一层**不能** `deny_unknown_fields`，否则第一步就死了）；再按版本选严格结构（今天的 `RawManifest`）做第二步解析。
    > - **老 daemon + 新 manifest 的 pre-handshake 行为**：第一步读到 `manifest_version` 高于自己支持的、或 `min_daemon_protocol` 高于自己的协议上限 → **拒绝并给出可读原因**（「本模块要求 manifest v3 / 协议 ≥5，本 daemon 支持 v2 / ≤4」），**不是**一条泛化的 serde 解析失败。
    >
    >   **这条的适用边界要如实写**：它只对**已经带上信封解析器的 daemon**成立。**今天已经发布出去的 daemon 不会被追溯升级**，它们遇到未来的新 manifest 只会给一条 serde 错误——那是既成事实，接受它，不要在文档里假装本条能覆盖。本条真正保证的是「从这一版起，往后每一次 schema 演进都有可读的失败」。
