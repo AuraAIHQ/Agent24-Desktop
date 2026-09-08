@@ -57,7 +57,8 @@
 - 客户端自己塞的 `X-A24-*` —— **一律先删再由内核写入**，否则模块会收到一个用户伪造的租约（§3）。
 
 **注入（内核写入，模块只能读）**
-- `X-A24-Request-Id`：§3 的租约；
+- `X-A24-Request-Id`：**非秘密的相关性 id**（可进日志、trace、指标）；
+- （**将来**，跨空间上线时）`X-A24-Request-Lease`：**秘密的 bearer 租约**，与上面那个分开——见 §3；
 - 最小化的调用上下文（不是 bearer，不是原始凭据）。
 
 **响应侧同样受约束**
@@ -100,7 +101,7 @@
 | `_a24/memory/private/{remember,recall,recent}` | `ScopedMemory::{remember,recall,recent}` | 只认连接；**不接受租约字段**；大小上限 + 显式 page size/cursor + 可取消（§5） |
 | `_a24/memory/scoped/{remember,recall,recent}` | （进程内无对应物） | 租约**必填**；无效即 forbidden，**绝不回退到 private** |
 | `_a24/events/emit` | `EventSink` | 只能发自己 `event_module` 的事件 |
-| `_a24/approval/request` | 审批门 | 需租约 **且** 绑定动作与 payload（§6） |
+| `_a24/approval/request` | 审批门 | **本轮不需要租约**（单用户/home org,没有「向谁请示」的歧义);必须绑定**内核规范化后的动作 + payload 摘要**(§6),并带 `X-A24-Request-Id` 做相关性。多用户上线时这条要改成需要租约 |
 
 `_` 前缀与 `_meta` 是 ADR-031 定的 ACP 对齐惯例。**`_meta` 永不参与授权与分区**——它是给扩展带附加信息的，不是给模块说自己是谁的。
 
@@ -164,7 +165,9 @@ _a24/memory/scoped/{remember,recall,recent}    ← 租约必填；租约无效 =
 
 **代价**：后台任务可以在无人在场时写自己的库。§5 的后台清单是这条代价的对价，不是可选项。
 
-**租约（request lease）**：内核在代理入站请求时生成一个不可猜测的租约 ID，注入为 `X-A24-Request-Id`，并在**内核自己的表**里绑定 `(org, space, principal, module, 到期)`。凡是超出自己私有分区的回调，以及一切审批请求，都必须带上它；内核拿它查自己的表得出 scope，**从不采信模块发来的任何 scope 字段**——协议里根本没有这样的字段。
+**租约（request lease）——本轮不签发，形状现在定死（§3 裁决 b）**：内核在代理入站请求时生成一个不可猜测的租约，注入为 **`X-A24-Request-Lease`**，并在**内核自己的表**里绑定 `(org, space, principal, module, 到期)`。凡是超出自己私有分区的回调都必须带上它；内核拿它查自己的表得出 scope，**从不采信模块发来的任何 scope 字段**——协议里根本没有这样的字段。
+
+> **租约与 `X-A24-Request-Id` 必须是两个头，不能复用一个。** `X-A24-Request-Id` 是相关性 id，它会进 tracing、错误报告、访问日志、指标标签——这是它的用途。**把同一个字段将来升级成 bearer authority，等于要回头审计每一条日志、每一处回显、每一个 SDK**，那不是纯加法。所以现在就分开：`Request-Id` 非秘密、可记录；`Request-Lease` 是秘密，禁止日志、禁止回显、响应侧剥离、全链路 redact。
 
 租约的性质：
 
@@ -198,9 +201,25 @@ _a24/memory/scoped/{remember,recall,recent}    ← 租约必填；租约无效 =
    > **那前向兼容怎么办？** `deny_unknown_fields` 会让协议加不了可选字段——这和 MUST 2/3（将来加 `scoped/*`）是矛盾的。解法用文档里已有的东西：**扩展一律走 `_meta`**（ACP 惯例，§3 上面已定），`_meta` 内部宽容、可带未知键；方法参数本体严格。于是「可扩展」和「拒绝夹带」各得其所。**而 `_meta` 永不参与授权与分区**这条铁律因此更要紧了：它现在是唯一一个宽容的位置，也就是唯一一条可能被拿来夹带 scope 的路径。ME-3d 必须有一条否定用例：`_meta` 里放 `org`/`space`/`lease` 不产生任何效果。
 2. **方法名空间现在就分好，`scoped/*` 保留但不实现。** 未实现时返回稳定的 `method not found`，**不是** fallback 到 `private/*`。这样将来上线 `scoped/*` 不改任何既有方法的含义。
 3. **`initialize` 的能力协商必须带版本，并且现在就要有。** 将来 `scoped/*` 上线时，新 daemon 会遇到老模块、老 daemon 会遇到新模块——没有版本协商就只能靠猜。协商结果里要能表达「这个方法族本 daemon 不提供」。
-4. **租约按*每请求*建的设计现在就写死，即使本轮不签发。** §3 已经这么定了：一旦按连接建，将来多用户时改不动。本轮不实现签发，但协议里租约的位置、生命周期与绑定规则不改。
+4. **租约按*每请求*建的设计现在就写死，即使本轮不签发**，且**用它自己的头 `X-A24-Request-Lease`**，不复用 `X-A24-Request-Id`（理由见上）。一旦按连接建，将来多用户时改不动。
 
-**存储层其实已经准备好了**，不需要为多用户改：分区键是 `(org, space)` 二维、长度前缀、带 `v2\0` 版本前缀，编码对**任意** space 都成立（测试里已经在用任意 space 构造器）。今天缺的**不是存储能力，是授权能力**——「谁有资格指向一个非私有的 space」。
+5. **`scoped/*` 将来必须是一条*独立请求、独立授予*的能力，不能落在今天的 `memory` 之下。** 这条是最容易漏、漏了「纯加法」就是假的那一条：
+   > 今天 `Capability::Memory` 是**一个粗粒度的布尔**（`rust/crates/agent24-domain/src/lib.rs`），`Grants` 只能表达「有没有 Memory」，表达不了「只有 private」或「允许 scoped」。所以如果将来新 daemon 上线 `scoped/*` 而沿用同一个 `memory`，**所有历史上请求过 `memory` 的模块会自动获得跨空间能力**——旧 grant 的含义被扩大了，那是破坏性变更，不是加法。
+   >
+   > **方法名分开、版本协商，解决的是「这个方法存不存在」，不是「这个模块该不该有」——那是功能协商，不是授权协商。**
+   >
+   > 定死：老 manifest 的 `memory` **永远只映射到 `memory.private`**；`memory.scoped` 是一条新的、必须显式请求且显式授予的能力（形状建议 `ProviderCapability::{MemoryPrivate, MemoryScoped, Events, Approval}`，或等价的结构化 memory grant）。**即使模块持有一张有效租约，没有 scoped grant 也必须 forbidden。**
+   >
+   > 这条现在就要有一条否定用例（见 §8）：`旧 manifest 请求 memory` + `新 daemon 支持 scoped` + `请求中有有效租约` ⇒ `scoped/*` 仍然 forbidden。
+
+**存储层就绪到哪一层，要说准**——初稿写「存储层已经准备好了，不需要为多用户改」，**那是把一个局部性质说成了全局性质**，收回：
+
+- ✅ **就绪的**：物理 owner-key 编码与底层事件表。`partition_key(org, space)` 是二维、长度前缀、带 `v2\0` 版本前缀，对**任意**字符串都成立。
+- ❌ **未就绪的**：生产构造与 catalog 生命周期。任意 `SpaceId` 的构造器是 `#[cfg(test)]` 的；唯一的生产构造器是 `module_private`；`OsMemoryCatalog::record` **无条件**把 manifest 名折成私有 space，并且「记不下就不出借」是它明写的不变量；catalog 把 `module_name` 当作**首次所见、写一次**的列（migration 0013），于是「一个 partition 由一个 module 首次且持续归属」今天是一条不变量——而 shared space 的定义恰恰是多个 provider 访问同一个 `(org, space)`。
+
+所以将来至少还要：加一条受内核控制的生产 `SpaceId` 构造路径；把「创建/登记一个 space」与「某 module 持租约访问一个已有 space」拆开；改掉「每次出借都按当前 module 重新 record」这条不变量；裁决 `module_name` 是首次创建者的 provenance 还是必须从 schema 里拆走。（`UNIQUE(org_id, space_id)` 不是障碍，那是正确的约束。）
+
+今天缺的**不只是授权能力**，还有上面这层 catalog 语义。
 
 **真正挡在多用户前面的也不在 ME-3**，如实列出来免得以后误以为是 ME-3 欠的债：
 
@@ -305,6 +324,15 @@ disable / 停机       →  ①原子撤销 generation → 拒绝新 RPC → 取
 3. **真要成为「门」，批准之后必须由内核执行该动作**，或者内核发一个**一次性、且只对该 payload 有效**的操作凭据。
 4. 做不到 3 的话，就**如实叫它「审批 UX / 建议」，不能叫门**——因为模块可以无视结果自己执行（§0：它本来就能直接动数据库）。
 
+> **取 (b) 之后，审批的授权基础要重说一遍（否则文档自相矛盾：裁决说租约推迟，审批却要求持租约）。**
+>
+> 租约在多用户设计里回答的是「代表**谁**请示」。而本轮范围是**单用户 / home org**——只有一个 principal，「向谁请示」不是一个问题。所以本轮审批**不需要租约**，它需要的是另外两样，两样都与租约无关：
+>
+> 1. **相关性**：带 `X-A24-Request-Id`（非秘密），说清「这是哪一次代理请求引出的」。
+> 2. **因果与完整性**：绑定内核规范化后的**动作类型 + 目标 + payload 摘要**，即本节上面四条。这才是「批准 A、执行 B」的解药——租约从来不是。
+>
+> **多用户上线时这条要改**：那时「向谁请示」变成真问题，审批必须同时持租约。这不是加法，是一次明确的语义收紧，现在写下来免得那天有人以为可以原样沿用。
+>
 > 与 ACP 的 `session/request_permission` 是同一件事的两个语境：那边归因到 session，这边归因到 request + payload。ADR-031 只核到语义层，**字段级契合度仍未验证**（§10）。
 
 ---
@@ -323,11 +351,23 @@ disable / 停机       →  ①原子撤销 generation → 拒绝新 RPC → 取
 |---|---|---|---|---|
 | **ME-3a** | **发现与安装层**：包目录 + registry schema、从磁盘读 manifest、重名处理、安装/卸载原子性、CLI 行为；manifest 支持 `impl_kind: out-of-process` + spawn 命令 | ME-2 | 非法 manifest / 重名 / spawn 目标不存在 / spawn 参数非法 全部被拒且不落盘 | catalogue 不再是编译进去的 |
 | **ME-3b** | 受约束代理（§2）+ 进程监督（起/停/崩溃退避/熔断/进程组终止） | ME-3a | mock 后端**回显它实际收到的 header**，断言 bearer 与客户端伪造的 `X-A24-*` 都看不见；无 token 访问模块路由 401；越命名空间的 `Location` 不被跟随；子进程被 kill 后自动重启、期间该命名空间 503（不是 500/挂起）；快速崩溃触发熔断 | 模块看不到内核凭据；一个模块挂掉不带走内核（broker 层） |
-| **ME-3c** | 回调通道：**NDJSON framing + 单行上限**、令牌握手（每次 spawn 轮换）、`initialize` 能力协商（offer set = `{Memory, Events, Approval}`，实际 grants 取 `manifest 请求 ∩ offer`） | ME-3b | 超长行在解析前被拒并断连；未授予的能力对应方法稳定返回 forbidden；模块报的 manifest 摘要与内核不符时握手失败 | 实现者不需要猜 framing |
-| **ME-3d** | 记忆回调:**本轮只实现 `private/*`**(只认连接);`scoped/*` 保留方法名空间但不实现(§3 裁决 b) + 真配额 + 双向上限 + page size/cursor + 可取消 | ME-3c | **`private/*` 收到租约/scope 字段必须*报错*,不是忽略**(§3 留门第 1 条,本项最重要);**`scoped/*` 返回稳定的 method-not-found,不 fallback 到 `private/*`**;**`_meta` 里夹带 `org`/`space`/`lease` 不产生任何效果**;后台任务能写 `private/*`；**请求结束后再用同一租约被拒**；过期租约被拒；**跨连接使用别的模块的租约被拒**；超配额写入返回明确错误；响应按 page size 分页（不是先构造再截断）；断连即取消 | 模块影响不了分区键;且 `private/*` 关不上的门一个都没留(§3 四条 MUST 各有一条否定用例) |
-| **ME-3e** | 事件回调（只能发自己 `event_module`）+ 审批（绑定动作 + payload 摘要，§6;并按 §3 选定 (a) 加进程内 `ApprovalRequester` 或 (b) 拆 `ProviderCapability`） | ME-3c | 没在 manifest 里请求 `approval` 的模块拿不到审批（升级 daemon 不会凭空授予）； 发别人模块的事件被拒；用 A 的租约为 B payload 请求审批被拒；重放被拒；**批准后改 payload 被拒**；批准/拒绝的执行路径符合 §6 第 3 条（或文档如实降级为「建议」） | 「批准 A、执行 B」不可能 |
+| **ME-3c** | 回调通道：**NDJSON framing + 单行上限**、令牌握手（每次 spawn 轮换）、`initialize` 能力协商（offer set = `{Memory, Events, Approval}`，实际 grants 取 `manifest 请求 ∩ offer`） | ME-3b | 超长行在解析前被拒并断连；未授予的能力对应方法稳定返回 forbidden；模块报的 manifest 摘要与内核不符时握手失败；**版本协商矩阵**:模块报的协议版本高于/低于内核支持范围各有确定行为(不是崩、不是默默继续)；协商结果能表达「本 daemon 不提供 `memory.scoped` 这个方法族」；**params 解析失败固定返回 `-32602 Invalid params` 且不 dispatch handler**;**一条坏 params 只失败该行 RPC,连接继续处理下一行**(只有 framing 超限才断连);**重复的 JSON object key 被拒**(否则先解析成 Map 会丢掉「这个字段出现过几次」这一事实) | 实现者不需要猜 framing,也不需要猜版本不匹配时会怎样 |
+| **ME-3d** | 记忆回调:**本轮只实现 `private/*`**(只认连接);`scoped/*` 保留方法名空间但不实现(§3 裁决 b) + 真配额 + 双向上限 + page size/cursor + 可取消 | ME-3c | **`private/*` 收到租约/scope 字段必须*报错*,不是忽略**(§3 留门第 1 条,本项最重要);**`scoped/*` 返回稳定的 method-not-found,不 fallback 到 `private/*`**;**`_meta` 里夹带 `org`/`space`/`lease` 不产生任何效果**（`_meta` 是唯一宽容的位置,因此是唯一可能的夹带路径）;**旧 manifest 请求 `memory` + 新 daemon 支持 scoped + 请求中有有效租约 ⇒ `scoped/*` 仍 forbidden**（门第 5 条:老 grant 的含义不因升级而扩大）;后台任务能写 `private/*`；**请求结束后再用同一租约被拒**；过期租约被拒；**跨连接使用别的模块的租约被拒**；超配额写入返回明确错误；响应按 page size 分页（不是先构造再截断）；断连即取消 | 模块影响不了分区键 |
+| **ME-3e** | 事件回调（只能发自己 `event_module`）+ 审批（**本轮不持租约**,绑定动作 + payload 摘要 + `X-A24-Request-Id` 相关性,§6;并按 §3 选定 (a) 加进程内 `ApprovalRequester` 或 (b) 拆 `ProviderCapability`） | ME-3c | 没在 manifest 里请求 `approval` 的模块拿不到审批（升级 daemon 不会凭空授予）；发别人模块的事件被拒；**为 A 请求审批、批准后改 payload 再执行被拒**；重放被拒；批准/拒绝的执行路径符合 §6 第 3 条（或文档如实降级为「建议」） | 「批准 A、执行 B」不可能 |
 | **ME-3f** | **仓外** mock Provider 包 + 端到端 | ME-3a–e | **黑盒**：先构建 daemon；之后生成并安装一个**仓库之外**的 mock 包；不改源码、不重新构建，重启后完成挂载 → 路由代理 → 事件转发 → 记忆读写 → 审批 往返全绿 | **装第三方 OS 零改内核**（这一条只有黑盒测法算数） |
 | **ME-3g** | F4e：启用路径做准入校验 | ME-3a | 准入被拒的模块 `enable` 返回错误且不落盘 | 不再有「启用了但永不生效」的条目 |
+
+### 五条门的验收覆盖 —— 如实，不是「各有一条否定用例」
+
+初稿在验收列里写过「四条 MUST 各有一条否定用例」。**核过之后那句是空话**，改成这张表：
+
+| 门 | 本轮覆盖 | 说明 |
+|---|---|---|
+| 1. `private/*` 拒绝租约/scope 字段 | ✅ ME-3d | `deny_unknown_fields` 使其成为解析期失败;另加 `_meta` 夹带否定用例 |
+| 2. `scoped/*` 不 fallback | ✅ ME-3d | 稳定 method-not-found |
+| 3. `initialize` 带版本协商 | ✅ ME-3c（本轮补上） | 初稿只测了超长行/未授予能力/摘要不符,**没有任何版本负例**——已补版本矩阵 |
+| 4. 租约按每请求建、用独立的秘密头 | ⚠️ **本轮无法验收，标 F8c/F9 deferred** | 本轮不签发租约,「过期/请求结束/跨连接被拒」只能靠测试伪造租约表——**那正是 §3 刚否掉的「测试证明生产不存在的性质」。不计入 ME-3d。** 本轮只验一件事:协议里 `X-A24-Request-Lease` 这个位置存在且与 `X-A24-Request-Id` 是两个头 |
+| 5. `scoped` 是独立请求独立授予的能力 | ✅ ME-3d | 旧 manifest + 新 daemon + 有效租约 ⇒ 仍 forbidden |
 
 **总验收**：ME-3f 的黑盒往返通过，**且** ME-3d/3e 的否定用例全绿。只跑通「路由代理 + 事件转发」不算 ME-3 完成——身份绑定、审批绑定、配额是本设计提升为 MUST 的。
 
