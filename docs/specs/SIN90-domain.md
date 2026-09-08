@@ -1,6 +1,30 @@
 # SIN90 — 内置 Personal-OS 领域模型(接口草案)
 
 > 设计草案 v0.3(2026-08-09)。配套:[集成约定](../SIN90-PET0-INTEGRATION.md)。
+>
+> ---
+>
+> ⚠️ **§0 的边界论述已被 ADR-029 / ADR-030 / ADR-031 取代**(本文写于三条 ADR 之前)。
+> 三处以 ADR 为准,不以本文为准:
+>
+> 1. **缝是通用的,不是 Sin90 专属的。** §0 提出的 `Sin90KernelCtx` trait
+>    **从未实现**(全仓零引用)。实际交付的是通用的 `DomainModule` + `KernelCtx`
+>    (ADR-029 / ME-1),Sin90 是它的第一个实现——这样 agent24d 才不必按名字
+>    认识 Sin90,第二个领域 OS 来时不用再抽一次。
+>    随之作废的还有 §0 那句「将来拆进程加个 RPC adapter 即可,**业务代码不动**」:
+>    进程外时 `(org, space)` 无法从长期连接得出,回调要带请求租约,业务代码要动
+>    (见 `SPEC-ME3-OUT-OF-PROCESS.md` §3)。
+> 2. **能力清单对不上。** §0 说 ctx 给 `model()/scheduler()/events()/authz()`。
+>    内核**实授**的是 `KERNEL_GRANTS = {Events, Memory}`
+>    (`rust/apps/agent24d/src/domain.rs`)——model / scheduler / authz 一个都没给
+>    (没有 handle 可给),反而多了一个 §0 完全没提的 **Memory**。
+> 3. **隔离是两层,§0 只写了一层。** `sin90.db` 的独立**仍然有效且不变**;
+>    但共享**记忆底座**(M-D 的 EventLog / AssertionLedger / ArtifactStore)是所有
+>    模块共用的,那里的归属由 **(组织, 空间) 所有权维度**决定(ADR-030),分区键
+>    `(org, os:sin90)` 做长度前缀编码。§0 对这一层零覆盖。
+>
+> **§0.1 / §0.2 仍然完全有效**——proposal 状态/审批/apply 全落 `sin90.db` 单事务、
+> 内核副作用走 apply 后的幂等 outbox 对账、不做跨库两阶段提交。这是本文最有价值的部分。
 > **架构定调**:Sin90 是内核之上的**可加载模块**,**自带独立 DB `sin90.db`**,
 > 依赖单向(Sin90 → 内核,内核绝不反向依赖 Sin90)。持久化**不塞进
 > `agent24-store`**——Sin90 自带 store。**本文件是接口契约草案,非最终实现;

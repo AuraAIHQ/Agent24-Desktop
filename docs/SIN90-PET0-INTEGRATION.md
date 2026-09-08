@@ -27,7 +27,7 @@ Pet0 写进文档的 6 条硬约束,Agent24 的 Rust core 已用代码实现每�
 | Pet0 原则 | Agent24 现成实现 |
 |---|---|
 | Database is source of truth, AI is not | 同一套地基(sqlx SQLite + `BEGIN IMMEDIATE` + 迁移矩阵校验),但 Sin90 用**自己的** `sin90.db`,不写 `agent24-store` |
-| AI 输出只是 Proposal,落库必过确定性校验 | `agent24-policy`:fail-closed 审批门(**只读**复用其放行判定);事务在模块自己的 `sin90.db` 里 |
+| AI 输出只是 Proposal,落库必过确定性校验 | 确定性校验 + 事务全在模块自己的 `sin90.db` 里。**注**:「只读复用内核 `agent24-policy` 的放行判定」是**目标形态,尚未实现**——内核实授给领域模块的能力是 `{Events, Memory}`,`Policy` 没有 handle 可给(`rust/apps/agent24d/src/domain.rs` 的 `KERNEL_GRANTS`) |
 | Core 不依赖具体模型,只依赖 IntelligenceProvider | `agent24-core` 按 ADR-026 只依赖 protocol+thiserror;`agent24-models` 是最小 `ModelProvider` trait |
 | 每次状态变更都产生事件 | `EventSink` + append-only 审计(hash-chain) |
 | Router 每次路由决策都记账 | store 的 hash-chained audit log |
@@ -102,8 +102,10 @@ Sin90 是 Agent24 提供的 **Personal-OS 领域模型**,以**内核之上的可
 AI(本地脑或 Codex)产出的一切都是 `Sin90Proposal`,经确定性校验后转事务落库并产事件。
 
 **事务在 `sin90.db` 里,不在 `agent24-store`。** proposal 的状态、审批与 apply 全落
-模块自己的库、走单个事务;内核的 `agent24-policy` 只被**只读**查询(standing-grant
-放行判定),不写审批行、不参与事务。跨库 approval + apply 正是 `SIN90-domain.md` §9
+模块自己的库、走单个事务。(**目标形态,尚未实现**:内核的 `agent24-policy` 被**只读**
+查询 standing-grant 放行判定,不写审批行、不参与事务。今天内核不授予领域模块
+`Capability::Policy`,所以这条查询还没有通路——见 `rust/apps/agent24d/src/domain.rs`
+的 `KERNEL_GRANTS`。)跨库 approval + apply 正是 `SIN90-domain.md` §9
 第 1 条(Critical)要消灭的形状 —— 照旧稿的「复用 `agent24-store` 事务」实现,
 等于把它复刻回来。
 
@@ -129,7 +131,7 @@ Agent24 提供三级路由 policy 层 + `sin90_ai_calls` 记账(每次决策记�
 
 ### 4.1 Agent24 做(我们)
 
-1. **`agent24-sin90` 领域 crate**:§3 的实体 / 状态机 / 事件日志 / Proposal 门(自带 `agent24-sin90-store`,独立 `sin90.db`;只**只读**用内核 policy 的放行判定)。
+1. **`agent24-sin90` 领域 crate**:§3 的实体 / 状态机 / 事件日志 / Proposal 门(自带 `agent24-sin90-store`,独立 `sin90.db`。「只读用内核 policy 的放行判定」是目标形态,尚未实现——见 §5 上方的注)。
 2. **可配置模型网关**:`agent24-models` provider 注册表——Executive(Codex/OpenAI 兼容)+ Local(GGUF/MLX 经 oMLX)+ 三级路由 policy + `sin90_ai_calls` 审计。
 3. **调度**:`agent24-scheduler`(现成)接 Sin90 的 Rhythm / Nudge 触发(cron/every/at,防重放)。
 4. **记忆**:`agent24-memory`(现成)作 Sin90 记忆底座(L0 KV + session 压缩)。
@@ -157,14 +159,35 @@ Agent24 提供三级路由 policy 层 + `sin90_ai_calls` 记账(每次决策记�
 
 ---
 
-## 5. Sin90 API 面(agent24d 新增,契约草案)
+## 5. Sin90 API 面
 
-沿用现有 `/api/v1/*` + bearer + WS 约定。全部 `/api/v1/sin90/` 前缀:
+沿用现有 `/api/v1/*` + bearer + WS 约定。全部 `/api/v1/sin90/` 前缀。
+
+> ⚠️ **本节分两栏,别混着读。** 左边是 main 上**今天就能调**的;右边是**目标接口,
+> 尚未实现**——照右边写的客户端会拿到 404。权威源是
+> `rust/crates/agent24-sin90-os/src/lib.rs` 的路由表与
+> [`protocol/openapi.yaml`](../protocol/openapi.yaml),**不是本文件**。
+> 本节上一版把全部 15 条列成一张平表,读起来像全都有,实际只有 7 条。
+
+### 5.1 main 已提供(7 条,已在 openapi.yaml 里)
 
 ```
-# 领域实体(GET 列表 / POST 建 / GET 单个 / PATCH 迁移状态)
 GET|POST         /api/v1/sin90/directions
-GET|PATCH        /api/v1/sin90/directions/{id}      # PATCH body = {to: <status>, ...},走状态机校验
+GET|POST         /api/v1/sin90/schedule-blocks
+GET|PATCH        /api/v1/sin90/schedule-blocks/{id}   # PATCH body = {to: <status>, ...},走状态机校验
+GET|POST         /api/v1/sin90/proposals              # 提交一个 Sin90Proposal
+GET              /api/v1/sin90/proposals/{id}
+POST             /api/v1/sin90/proposals/{id}/accept
+GET              /api/v1/sin90/attention?window=week  # planned vs actual,纯事件回放
+
+# 事件流(复用现有 WS,内核提供)
+GET              /api/v1/events
+```
+
+### 5.2 目标接口(尚未实现)
+
+```
+GET|PATCH        /api/v1/sin90/directions/{id}
 GET|POST         /api/v1/sin90/rhythms
                  # 注意:Rhythm **没有** PATCH /{id}。它的变更不是状态迁移,是重新
                  # 分配占比,必须经 Proposal 门的 `AdjustRhythm{rhythm_id,new_alloc}`
@@ -174,21 +197,9 @@ GET|POST         /api/v1/sin90/weeks
 GET|PATCH        /api/v1/sin90/weeks/{id}
 GET|POST         /api/v1/sin90/tasks
 GET|PATCH        /api/v1/sin90/tasks/{id}
-GET|POST         /api/v1/sin90/schedule-blocks
-GET|PATCH        /api/v1/sin90/schedule-blocks/{id}
 GET|POST         /api/v1/sin90/reviews
 GET|PATCH        /api/v1/sin90/reviews/{id}
-
-# Proposal 门(AI 产出 → 用户确认 → 落库)
-POST             /api/v1/sin90/proposals            # 提交一个 Sin90Proposal
-POST             /api/v1/sin90/proposals/{id}/accept
 POST             /api/v1/sin90/proposals/{id}/reject
-
-# 对账 / 注意力预算(SPIKE-00 判定面)
-GET              /api/v1/sin90/attention?window=week # planned vs actual,纯事件回放
-
-# 事件流(复用现有 WS)
-GET  /api/v1/events
 ```
 
 **事件信封是通用的,不是 `sin90.*`。** 领域模块触达 WS 流只有一条缝:`type` 恒为
@@ -263,5 +274,5 @@ Agent24 的「魂」含 Nostr/联邦/多渠道(`nostr-bridge`/`wechat-bridge`/�
 
 1. Pet0 壳最终选 Tauri 还是复用 Electron?(不阻塞本约定,但影响分发与复用估算)
 2. ~~Local 脑走 oMLX 能否吃 Qwen3-0.6B?~~ **已定(2026-08-09 调研)**:能,且**无需新增 GGUF provider**。oMLX(mlx-lm 底座,OpenAI/Anthropic 兼容)原生支持 `response_format: json_schema` 结构化输出,满足 Local 脑"受约束 JSON"硬约束;Qwen3-0.6B 由 mlx-lm 支持、mlx-community 有量化权重。链路 = `agent24-models` 现成 OpenAI provider → oMLX:8088 → Qwen3-0.6B。动作:`omlx` 拉一次 0.6B 权重 + 量 p95。注意 `enable_thinking=false`(Qwen3 thinking token 会破坏 JSON,与 Pet0 架构一致)。额外:HF cache 已有 `Qwen3-ASR-0.6B` 可喂语音链路 STT。
-3. ~~Sin90 同库不同表 vs 独立 DB?~~ **已定**:**独立 DB `sin90.db` + 可加载模块**,比同库更彻底。Sin90 是内核之上的模块,自带 store,依赖单向(Sin90→内核,内核绝不反向依赖)。两种交互不一刀切:**壳↔Sin90 走 HTTP/WS API**;**Sin90↔内核走进程内 ctx 句柄**(模块 `register(router,ctx)`,热路径不加 HTTP 跳)。不做独立进程纯 API——桌宠本地单机拿不到独立进程的好处却要付运维税(但边界用 `Sin90KernelCtx` trait 定义,进程内只是第一个 adapter,将来可加 RPC adapter 拆进程)。**跨库一致性(Codex 自审收口)**:proposal 的状态/审批/apply **全落 sin90.db 单事务**,内核 policy 仅被**只读**查询是否放行;需要写内核的副作用(如注册 cron)经 apply 后的**幂等 outbox 对账**,不跨库两阶段提交。详见 [SIN90-domain.md §0.1/§0.2](specs/SIN90-domain.md)。
+3. ~~Sin90 同库不同表 vs 独立 DB?~~ **已定**:**独立 DB `sin90.db` + 可加载模块**,比同库更彻底。Sin90 是内核之上的模块,自带 store,依赖单向(Sin90→内核,内核绝不反向依赖)。两种交互不一刀切:**壳↔Sin90 走 HTTP/WS API**;**Sin90↔内核走进程内 ctx 句柄**(模块 `register(router,ctx)`,热路径不加 HTTP 跳)。不做独立进程纯 API——桌宠本地单机拿不到独立进程的好处却要付运维税(边界用 trait 定义,进程内只是第一个 adapter。**订正**:那条 trait 最终落成**通用**的 `DomainModule` + `KernelCtx`(ADR-029),不是本文当初设想的 Sin90 专属 `Sin90KernelCtx` —— 后者从未实现;而「拆进程业务代码不动」也不成立,进程外时回调要带请求租约,见 `specs/SPEC-ME3-OUT-OF-PROCESS.md` §3)。**跨库一致性(Codex 自审收口)**:proposal 的状态/审批/apply **全落 sin90.db 单事务**,内核 policy 仅被**只读**查询是否放行(**尚未实现**,见 §5 上方的注);需要写内核的副作用(如注册 cron)经 apply 后的**幂等 outbox 对账**,不跨库两阶段提交。详见 [SIN90-domain.md §0.1/§0.2](specs/SIN90-domain.md)。
 4. `.petpack` 的 behaviors.json 沙箱与 Agent24 的模块/审批模型如何对齐?
