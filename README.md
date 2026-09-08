@@ -7,7 +7,7 @@
 **Agent24 是框架，不是应用。** 我们提供：
 
 - **外壳无关（shell-agnostic）**：Rust 内核 + daemon 与前端解耦，壳只经 HTTP/WS 协议连接——自带 Electron 参考外壳，Tauri 外壳（如 Pet0 桌宠）等同样可挂载
-- **多端**：桌面已落地（Electron 参考壳，macOS / Windows / Linux 分发）；移动（iOS / Android）与 Web 规划中，同属 shell-agnostic——移动端计划各提供 Tauri 与 Expo / React Native 瘦壳示例（见 [ADR-027](docs/decision.md)）。daemon 与模型可不在端上（如跑在你的 Mac），移动 / Web 端做瘦壳、只经 HTTP/WS 协议远程消费
+- **多端**：桌面已落地（Electron 参考壳，macOS / Windows / Linux 分发）；移动（iOS / Android）与 Web 规划中，同属 shell-agnostic——移动端计划各提供 Tauri 与 Expo / React Native 瘦壳示例（见 [ADR-027](docs/decision.md)）。daemon 与模型可不在端上（如跑在你的 Mac），移动 / Web 端做瘦壳、只经 HTTP/WS 协议远程消费。**注**：`agent24d` 今天固定绑 `127.0.0.1` 且没有 bind-address 参数，跨设备访问需要自备隧道/反代与相应的认证方案——「远程消费」是目标态
 - 后台 daemon + 用户交互一致性
 - 标准化能力模块接口（今天是 `packages/node-daemon` 的内部 `CapabilityModule`；对外 SDK 尚未发布）
 - AI 适配层（三级路由 + `ModelProvider` 缝）。**今天生产启动只走 `ModelRouter::from_env()`，构造 oMLX 与 Ollama 两个槽**；tier 按 URL 判定——非 loopback 的 `OMLX_URL` 会被重标为 `Remote`，好让 LocalOnly 的任务拒绝它而不是悄悄外泄。没有独立的 remote / lora 注册入口，没有 Claude provider，也没有运行时的设置页切换。iDoris 接入排在 P4 门后
@@ -138,11 +138,12 @@ pub trait KernelCtx: Send + Sync {
 
 ### 能力模块开发（TS CapabilityModule，由 `node-daemon` 承载）
 
-> 今天**没有对外发布的 SDK**：`CapabilityModule` 只是 `packages/node-daemon` 的内部接口，那个包是 private、只有 `main: dist/server.js`、不导出类型入口——**第三方模块 import 不到它**，只能按下面的结构实现（仓内模块用相对路径 `../capabilities/base`）。
+> 今天**没有对外发布的 SDK**：`CapabilityModule` 只是 `packages/node-daemon` 的内部接口，那个包是 private、只有 `main: dist/server.js`、不导出类型入口——**第三方模块 import 不到它**，只能按下面的结构实现（仓内模块按自己所在位置相对引用 `base`——放在 `src/capabilities/` 下就是 `./base`）。
 > 加载器 `require()` 包的入口后要求**包根直接带有 `manifest` 与 `register`**，所以别只 `export const myModule`：那样导出的是 `{ myModule }`，会被拒绝。
 
 ```ts
-// 仓内：import type { CapabilityModule } from '../capabilities/base'
+// 仓内（此文件放在 packages/node-daemon/src/capabilities/ 下）：
+//   import type { CapabilityModule } from './base'
 // 仓外：没有可 import 的类型，按结构实现即可
 const myModule = {
   manifest: {                       // 清单是必需的；没有顶层 id 字段
