@@ -58,6 +58,7 @@
 
 **注入（内核写入，模块只能读）**
 - `X-A24-Request-Id`：**非秘密的相关性 id**（可进日志、trace、指标）；
+- `X-A24-Approval-Token`：**秘密、不可猜、单次使用、绑定该请求**的审批凭据（§6）——禁日志、禁回显、响应侧剥离；
 - （**将来**，跨空间上线时）`X-A24-Request-Lease`：**秘密的 bearer 租约**，与上面那个分开——见 §3；
 - 最小化的调用上下文（不是 bearer，不是原始凭据）。
 
@@ -82,8 +83,8 @@
 > 2. `Policy` 的语义（查授权策略、判断 standing-grant 是否自动放行）比「向用户要一次审批」宽得多。为了要审批而顺手把策略查询给出去，是把授予集写松。
 >
 > **但新增 `Approval` 有一个陷阱，必须一并解决**：`KernelCtx` 今天只有 `events()` 和 `memory()`，**没有审批句柄**。若实现只是把 `Approval` 塞进公共的 `KERNEL_GRANTS`，进程内模块会被报告「已获授 Approval」却没有句柄可用——**恰好重犯上面用来反对 `Policy` 的那条罪**。二选一，实现时必须选定并写进 PR 描述：
-> - **(a)** 同时给进程内加一个 `ApprovalRequester` 句柄，保持 capability ↔ trait ↔ wire 三者一一对应（更干净）；
-> - **(b)** 拆出一个 `ProviderCapability`，让 `Approval` 只属于 ME-3 的 wire 契约，**不进**当前全局的 `KERNEL_GRANTS`。
+> - **(a)（选这个）** 同时给进程内加一个 `ApprovalRequester` 句柄，保持 capability ↔ trait ↔ wire 三者一一对应。
+> - ~~(b) 拆出 `ProviderCapability`，让 `Approval` 只属于 wire 契约~~ —— 不选：它把「授予了却没有句柄」这个问题在进程内原样留着，只是换了个地方不看见。
 >
 > **兼容性也要写**：`Capability` 是严格 serde 枚举，旧 daemon 会拒绝含 `approval` 的新 manifest；公共 Rust 枚举不是 `non_exhaustive`，加 variant 会让外部的穷尽 match 源码不兼容。需要定：最低 daemon / 协议版本、unsupported capability 的错误形状、旧 provider 拿到协商结果怎么办，以及对应的测试。
 
@@ -91,17 +92,30 @@
 
 **framing 必须钉死。** JSON-RPC 2.0 不定义字节流上的消息边界；不钉死 framing，实现者会各自猜 NDJSON / 长度前缀 / 读到 EOF，而且**没有 framing 就无法在分配与反序列化之前拒绝超大消息**——§5 的「双向上限」会变成空话。本轮选：**行分隔（NDJSON），单行最大长度硬上限，超限即断连**。不支持 batch（支持的话还要单独限 batch 条数）。
 
-同时要定死：请求 ID 类型、并发与乱序响应、未知方法、重复 ID、取消、超时、连接关闭语义；令牌出现在握手的哪个字段、每次 spawn 是否轮换、socket 与目录权限、允许的连接数。这些不是细节，是「实现者不猜」的前提。
+**下面这些同样钉死，不留给 PR 自选**（上一版把它们写成了一张待办清单——那等于把「实现者不猜」这句话本身留给实现者猜）：
+
+| 项 | 裁决 |
+|---|---|
+| 请求 ID 类型 | **字符串**，由**发起方**生成，对**同一条连接**唯一。不用整数（跨语言 SDK 的整数宽度不一致） |
+| 并发与乱序 | 允许并发在途，**响应可乱序**；调用方按 id 配对。并发上限见 §5，超限回 busy 错误而不是排队到内存里 |
+| 重复 ID | 同一连接上一个仍在途的 id 被复用 → **该请求失败**（不是覆盖、不是排队）；已完成的 id 可复用 |
+| 未知方法 | JSON-RPC `-32601 Method not found`，**稳定不变**。未授予能力的方法回 forbidden（应用层错误），**不是** `-32601`——两者必须能区分，否则模块无法分辨「这个 daemon 没有」与「我没被授权」 |
+| 取消 | `$/cancelRequest`（LSP 惯例），notification，携带目标 id；被取消的请求仍回一个响应（cancelled 错误）。**连接断开 = 该连接上全部在途请求取消** |
+| 超时 | 双向都有；内核侧超时后**不重试**（回调可能有副作用），记账并回 timeout 错误 |
+| 连接关闭 | 半关闭不支持；一端关闭即全关。在途请求按上面的取消语义处理 |
+| 握手令牌 | 在 `initialize` 的 `params.auth_token`（**正式字段**，不在 `_meta`）。**每次 spawn 轮换**（§5）。令牌只经**环境变量或预开 FD** 传给子进程，**不进命令行**（`ps` 可见） |
+| socket 与目录权限 | socket 与其父目录 `0700`，属主为 daemon 的 uid。路径由**内核**选定并传给子进程（§1） |
+| 允许的连接数 | 每个模块**同时只有一条**回调连接。第二条连接被拒；重连必须先让旧连接消失（配合 §5 的单 generation） |
 
 **方法集**。初稿说「与进程内 trait 一一对应」——**现在不成立了，别再这么写**：进程内的方法叫 `remember` 不叫 `write`；`Approval` 没有对应的 `KernelCtx` 方法；`scoped/*` 那一族在进程内根本没有对应物（进程内句柄是固定 scope 的）。ADR-031 里那句「薄 SDK 与 trait 一一对应」要么补齐 trait，要么删掉。
 
 | 方法 | 对应进程内 | 说明 |
 |---|---|---|
-| `initialize` | 挂载握手 | 模块报协议版本；内核回**授予的能力集**。模块报的 manifest 摘要**只用于与内核已加载的 manifest 比对**，不作为身份来源 |
+| `initialize` | 挂载握手 | 模块报协议版本**区间** `[min, max]`；内核回**协商出的唯一版本** + **授予的能力集**。模块报的 manifest 摘要**只用于与内核已加载的 manifest 比对**，不作为身份来源 |
 | `_a24/memory/private/{remember,recall,recent}` | `ScopedMemory::{remember,recall,recent}` | 只认连接；**不接受租约字段**；大小上限 + 显式 page size/cursor + 可取消（§5） |
 | `_a24/memory/scoped/{remember,recall,recent}` | （进程内无对应物） | 租约**必填**；无效即 forbidden，**绝不回退到 private** |
 | `_a24/events/emit` | `EventSink` | 只能发自己 `event_module` 的事件 |
-| `_a24/approval/request` | 审批门 | **本轮不需要租约**（单用户/home org,没有「向谁请示」的歧义);必须绑定**内核规范化后的动作 + payload 摘要**(§6),并带 `X-A24-Request-Id` 做相关性。多用户上线时这条要改成需要租约 |
+| `_a24/approval/request` | 审批门 | **本轮不需要 principal 租约**;必须绑定**内核规范化后的动作 + payload 摘要**(§6),并在 `params` 里带 `request_id`（相关性,非秘密）与 `approval_token`（一次性秘密凭据,§6）。多用户上线时叠加 principal 租约 |
 
 `_` 前缀与 `_meta` 是 ADR-031 定的 ACP 对齐惯例。**`_meta` 永不参与授权与分区**——它是给扩展带附加信息的，不是给模块说自己是谁的。
 
@@ -221,7 +235,13 @@ _a24/memory/scoped/{remember,recall,recent}    ← 租约必填；租约无效 =
 6. **manifest / capability schema 本身要有版本与兼容规则——`initialize` 的版本协商救不了它。** 这条是门 5 的前提,漏了门 5 就落不了地:
    > `DomainOsManifest` 今天是**顶层 `deny_unknown_fields` + 严格 capability 枚举**（`rust/crates/agent24-domain/src/lib.rs`）。所以将来一个写了 `memory.scoped` 的新 manifest,碰上老 daemon 会在**解析期**就失败——**早于 spawn、早于 `initialize`**。握手期的版本协商发生得太晚,根本轮不到它。
    >
-   > 定死:manifest 里的**最低 daemon / 协议版本**字段;未知 capability 的**稳定错误形状**(而不是一条泛化的解析失败);以及「老 daemon + 新 manifest」的 **pre-handshake 行为**——是拒绝并给出可读原因,还是按最低版本字段提前判定不兼容。
+   > **定死如下,不是「要定」**:
+   >
+   > - manifest 新增必填字段 **`manifest_version: u32`**（schema 自身的版本，与协议版本分开）和可选 **`min_daemon_protocol: u32`**。
+   > - 解析**分两步**：先用一个**宽容的**「信封」结构只读 `manifest_version` / `min_daemon_protocol` / `name`（这一层**不能** `deny_unknown_fields`，否则第一步就死了）；再按版本选严格结构做第二步解析。
+   > - **老 daemon + 新 manifest 的 pre-handshake 行为**：第一步读到 `manifest_version` 高于自己支持的、或 `min_daemon_protocol` 高于自己的协议上限 → **拒绝并给出可读原因**（「本模块要求 manifest v3 / 协议 ≥5，本 daemon 支持 v2 / ≤4」），**不是**一条泛化的 serde 解析失败。
+   > - **未知 capability** 的稳定错误形状：`{ error: "unknown_capability", capability: "<原样字符串>", supported: [...] }`。所以 `Capability` 的反序列化**不能**直接用严格枚举报错了事，要先收成字符串再映射——否则错误里说不出是哪个 capability。
+   > - `Capability` 这个公共枚举加 variant 会破坏外部的穷尽 `match`：加 **`#[non_exhaustive]`**，并在同一个 PR 里改掉仓内所有穷尽匹配。
 
 **存储层就绪到哪一层，要说准**——初稿写「存储层已经准备好了，不需要为多用户改」，**那是把一个局部性质说成了全局性质**，收回：
 
@@ -321,8 +341,8 @@ disable / 停机       →  ①原子撤销 generation → 拒绝新 RPC → 取
 
 **初稿在这里是错的。** 它只说「带上 `X-A24-Request-Id` 就能归因」。相关性 id 回答的是**「这是哪次请求」**——但一个相关性句柄证明不了因果与 payload 完整性。模块仍然可以：
 
-- 拿 A 操作的租约去为 B 操作请求审批；
-- 同一个租约重放，反复要审批；
+- 拿 A 操作的相关性 id 去为 B 操作请求审批（**这一条在本轮由 §6 下面的一次性 `approval_token` 挡**）；
+- 同一个凭据重放，反复要审批；
 - 拿到批准后，**执行与审批内容不同的操作**；
 - 被拒绝后照样自己执行。
 
@@ -352,7 +372,17 @@ disable / 停机       →  ①原子撤销 generation → 拒绝新 RPC → 取
 > request_id → { module, generation, 该请求是否仍在活跃, run/session/source(若有) }
 > ```
 >
-> 审批回调必须用它查回上下文；**陈旧的、跨连接的、请求已结束的一律拒绝**。这条不做，审批就没有「由某次代理请求引出」这个保证，只剩下 payload 摘要——那只挡住「批准 A、执行 B」，挡不住「拿一个过期的上下文去要审批」。
+> 审批回调必须用它查回上下文；**陈旧的、跨连接的、请求已结束的一律拒绝**。
+>
+> **但只有这张表还不够，而上一版没看见这个洞。** `request_id` 是**非秘密**的（它的用途就是进日志和 trace），而同一个模块**看得见自己所有并发请求的 id**。于是它可以在处理 A 时，拿一个**仍然活跃的** B 的 `request_id` 去请求审批——`{module, generation, 仍活跃}` 三项检查**全部通过**。
+>
+> **一个相关性查表能证明的只是「这个 id 存在、没过期、属于你」，证明不了「这次回调确实来自那次请求」。** 这跟 §6 上面那四条是同一类错误——把相关性当成因果。
+>
+> **所以本轮再加一个东西：每请求的一次性审批凭据。** 内核代理入站请求时，除了非秘密的 `X-A24-Request-Id`，再注入一个**秘密、不可猜、单次使用、绑定该请求**的 `X-A24-Approval-Token`；审批回调必须带它，用掉即失效。
+>
+> **它不是被推迟的那张 principal 租约**——两者回答不同的问题：租约回答「代表哪个 org/space 的哪个 principal」（多用户才有意义，已推迟）；这个 token 回答「你确实是在处理这一次请求」（单用户下同样有意义，本轮必须有）。它和 `X-A24-Request-Lease` 一样按秘密对待：禁日志、禁回显、响应侧剥离、全链路 redact。
+>
+> **仍要如实说清剩余边界**：token 挡住的是「拿别的活跃请求的上下文去请示」。它挡不住模块**在自己这一次请求里**请求一件与用户意图无关的事——那由 payload 摘要 + 用户看到的内容挡，不由这里挡。
 >
 > **一个必须现在说明、我不替你裁的缺口**：被代理的请求**未必有 `run_id`**——它来自外壳直接调 `/api/v1/<ns>/*`，不是一次 agent run。而内核现有的 `Approval` 类型 `run_id` 是必填。二选一（§10 公开问题）：给模块审批一个自己的类型/表，或为它铸一个合成 run。**不能**含糊过去,否则实现时会有人随手塞一个假 run_id。
 >
@@ -375,10 +405,10 @@ disable / 停机       →  ①原子撤销 generation → 拒绝新 RPC → 取
 | ID | 交付 | 依赖 | 测试 | 验收 |
 |---|---|---|---|---|
 | **ME-3a** | **发现与安装层**：包目录 + registry schema、从磁盘读 manifest、重名处理、安装/卸载原子性、CLI 行为；manifest 支持 `impl_kind: out-of-process` + spawn 命令 | ME-2 | 非法 manifest / 重名 / spawn 目标不存在 / spawn 参数非法 全部被拒且不落盘 | catalogue 不再是编译进去的 |
-| **ME-3b** | 受约束代理（§2）+ 进程监督（起/停/崩溃退避/熔断/进程组终止） | ME-3a | mock 后端**回显它实际收到的 header**，断言 bearer 与客户端伪造的 `X-A24-*` 都看不见；无 token 访问模块路由 401；越命名空间的 `Location` 不被跟随；**恶意模块在响应里回显 `X-A24-Request-Lease` / 任意 `X-A24-*`,客户端侧收不到**；子进程被 kill 后自动重启、期间该命名空间 503（不是 500/挂起）；快速崩溃触发熔断 | 模块看不到内核凭据；一个模块挂掉不带走内核（broker 层） |
-| **ME-3c** | 回调通道：**NDJSON framing + 单行上限**、令牌握手（每次 spawn 轮换）、`initialize` 能力协商（offer set = `{Memory, Events, Approval}`，实际 grants 取 `manifest 请求 ∩ offer`） | ME-3b | 超长行在解析前被拒并断连；未授予的能力对应方法稳定返回 forbidden；模块报的 manifest 摘要与内核不符时握手失败；**版本协商矩阵**,四格各有写死的结果:模块版本在内核支持区间内 → 协商出 `min(模块上限, 内核上限)`;模块版本**高于**内核上限 → 内核回自己的上限,由模块决定降级还是断开(不是内核默默按高版本继续);模块版本**低于**内核下限 → 握手失败并返回内核支持的区间(不是崩,也不是继续);模块**不报版本** → 视为低于下限。协商结果能表达「本 daemon 不提供 `memory.scoped` 这个方法族」;错误形状与 JSON-RPC error code 一并定死；**params 解析失败固定返回 `-32602 Invalid params` 且不 dispatch handler**;**一条坏 params 只失败该行 RPC,连接继续处理下一行**(只有 framing 超限才断连);**重复的 JSON object key 被拒**(否则先解析成 Map 会丢掉「这个字段出现过几次」这一事实) | 实现者不需要猜 framing,也不需要猜版本不匹配时会怎样 |
+| **ME-3b** | 受约束代理（§2）+ 进程监督（起/停/崩溃退避/熔断/进程组终止） | ME-3a | mock 后端**回显它实际收到的 header**，断言 bearer 与客户端伪造的 `X-A24-*` 都看不见；无 token 访问模块路由 401；越命名空间的 `Location` 不被跟随；**恶意模块在响应里回显 `X-A24-Approval-Token` / `X-A24-Request-Lease` / 任意 `X-A24-*`,客户端侧收不到**；子进程被 kill 后自动重启、期间该命名空间 503（不是 500/挂起）；快速崩溃触发熔断 | 模块看不到内核凭据；一个模块挂掉不带走内核（broker 层） |
+| **ME-3c** | 回调通道：**NDJSON framing + 单行上限**、令牌握手（每次 spawn 轮换）、`initialize` 能力协商（offer set = `{Memory, Events, Approval}`，实际 grants 取 `manifest 请求 ∩ offer`） | ME-3b | 超长行在解析前被拒并断连；未授予的能力对应方法稳定返回 forbidden；模块报的 manifest 摘要与内核不符时握手失败；**版本协商**:双方各报**区间** `[min, max]`,**取交集**;交集为空 → **握手失败**并把两边的区间都放进错误里;交集非空 → 选定**唯一**版本 `min(模块.max, 内核.max)` 并在响应里回显它,此后双方都按这个版本说话。**不允许**内核回一个模块没声明支持的版本(上一版写「模块高于内核上限→内核回自己的上限」,那可能选出模块根本不支持的版本 —— 错)。模块**不报区间** → 视为不兼容,握手失败。协商结果能表达「本 daemon 不提供 `memory.scoped` 这个方法族」;错误形状与 JSON-RPC error code 一并定死；**params 解析失败固定返回 `-32602 Invalid params` 且不 dispatch handler**;**一条坏 params 只失败该行 RPC,连接继续处理下一行**(只有 framing 超限才断连);**重复的 JSON object key 被拒**(否则先解析成 Map 会丢掉「这个字段出现过几次」这一事实) | 实现者不需要猜 framing,也不需要猜版本不匹配时会怎样 |
 | **ME-3d** | 记忆回调:**本轮只实现 `private/*`**(只认连接);`scoped/*` 保留方法名空间但不实现(§3 裁决 b) + 真配额 + 双向上限 + page size/cursor + 可取消 | ME-3c | **`private/*` 收到租约/scope 字段必须*报错*,不是忽略**(§3 留门第 1 条,本项最重要);**`scoped/*` 返回稳定的 method-not-found,不 fallback 到 `private/*`**;**`_meta` 里夹带 `org`/`space`/`lease` 不产生任何效果**（`_meta` 是唯一宽容的位置,因此是唯一可能的夹带路径）;**旧 manifest 的 `memory` 只被解析/映射成 `memory.private` entitlement**(门 5 本轮可验的那半;需要「新 daemon 支持 scoped + 有效租约」的那半随门 4 一起 deferred);后台任务能写 `private/*`；超配额写入返回明确错误；响应按 page size 分页（不是先构造再截断）；断连即取消 | 模块影响不了分区键 |
-| **ME-3e** | 事件回调（只能发自己 `event_module`）+ 审批（**本轮不持租约**,绑定动作 + payload 摘要 + `X-A24-Request-Id` 相关性,§6;并按 §3 选定 (a) 加进程内 `ApprovalRequester` 或 (b) 拆 `ProviderCapability`） | ME-3c | 没在 manifest 里请求 `approval` 的模块拿不到审批（升级 daemon 不会凭空授予）；发别人模块的事件被拒；**为 A 请求审批、批准后改 payload 再执行被拒**；重放被拒；批准/拒绝的执行路径符合 §6 第 3 条（或文档如实降级为「建议」） | 「批准 A、执行 B」不可能 |
+| **ME-3e** | 事件回调（只能发自己 `event_module`）+ 审批（**本轮不持租约**,绑定动作 + payload 摘要,回调在 `params` 里带 `request_id`(相关性)与 `approval_token`(一次性秘密),§6;并**取 §3 的 (a)**:同时给进程内加 `ApprovalRequester` 句柄,保持 capability ↔ trait ↔ wire 一一对应 —— 不留给实现者选,选 (b) 会让「授予了却没有句柄」在进程内继续存在） | ME-3c | 没在 manifest 里请求 `approval` 的模块拿不到审批（升级 daemon 不会凭空授予）；发别人模块的事件被拒；**为 A 请求审批、批准后改 payload 再执行被拒**；重放被拒；**并发串换被拒**（拿另一个仍活跃请求的 `request_id` + 自己的 `approval_token` ⇒ 拒；反之亦然）；`approval_token` 重放被拒（一次性）；旧 generation 的 token 被拒；批准/拒绝的执行路径符合 §6 第 3 条 —— **能否做到由 §10 的 `run_id` 裁决决定;裁决未下,ME-3e 阻塞,不得由实现者自行降级为「建议」** | 「批准 A、执行 B」不可能 |
 | **ME-3f** | **仓外** mock Provider 包 + 端到端 | ME-3a–e | **黑盒**：先构建 daemon；之后生成并安装一个**仓库之外**的 mock 包；不改源码、不重新构建，重启后完成挂载 → 路由代理 → 事件转发 → 记忆读写 → 审批 往返全绿 | **装第三方 OS 零改内核**（这一条只有黑盒测法算数） |
 | **ME-3g** | F4e：启用路径做准入校验 | ME-3a | 准入被拒的模块 `enable` 返回错误且不落盘 | 不再有「启用了但永不生效」的条目 |
 
