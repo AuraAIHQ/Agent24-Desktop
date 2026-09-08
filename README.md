@@ -90,54 +90,72 @@ DomainModule（Rust trait）             CapabilityModule（TS）
 |  | 领域 OS（`DomainModule`） | 能力模块（`CapabilityModule`） |
 |---|---|---|
 | 回答的问题 | 这台 agent 是**什么产品** | 这台 agent **多会一件事** |
-| 数量 | 同时只有一个 active（`active_domain_os`） | 可装多个 |
+| 数量 | 可同时挂多个（`os.json` 每个模块各有 enabled 位，`mount_all` 遍历全部）；**当前 build 的 catalogue 里只有 `sin90` 一个** | 可装多个 |
 | 语言 / 宿主 | Rust，挂进 `agent24d` | TS，跑在 `packages/node-daemon` |
 | 自带数据库 | ✅ 独立 DB + 独立迁移（如 `sin90.db`） | ❌ |
-| 记忆分区 | ✅ 共享记忆底座里的私有分区 `(org, os:<name>)`，模块间不可互读 | ❌ |
-| 路由命名空间 | `/api/v1/<name>/*`（有保留字防撞内核路由） | `/api/capabilities/<id>` |
+| 记忆分区 | ✅ 共享记忆底座里的私有分区 `(org, os:<name>)`——**经内核交出的 `ScopedMemory` 句柄**访问时模块间不可互读 | ❌ |
+| 路由命名空间 | `/api/v1/<name>/*`（由清单 name 派生，模块挂不到自己命名空间外；`RESERVED_KERNEL_SEGMENTS` 拦下撞内核顶级段的名字——同步靠一个扫源码字面量的测试，是检查不是结构保证） | `/api/capabilities/<id>`（惯例） |
 | 事件 | `EventBody::Module{module, kind, payload}` | — |
-| 隔离 | 进程内（ME-3 后可进程外）；**非沙箱** | **BoxLite 微 VM 沙箱**（Hypervisor.framework / KVM） |
-| 分发 | `agent24 os enable/disable`（目录当前编译进 daemon，ME-3a 解决） | npm registry + 市场浏览 + 安装同意摘要 |
+| 隔离 | 进程内（ME-3 后可进程外）；**非沙箱** | **本体也在 node-daemon 进程内，非沙箱**；仅 CodeBox 的代码执行与声明了 `container` 的服务负载走 **BoxLite 微 VM**（Hypervisor.framework / KVM） |
+| 分发 | `agent24 os enable/disable`（改配置，**下次启动生效**；目录当前编译进 daemon，ME-3a 解决） | npm registry + 市场浏览 + 安装同意摘要 |
 | 清单 | `domain-os.yml` → `DomainOsManifest` | [`protocol/module.schema.json`](protocol/module.schema.json) → `ModuleManifest` |
 
 > 两者的权限词表今天是两套（`module.schema.json` 明确记着「词表统一推迟到 M-E」），这笔债未还。
 
-**隔离是两层，不是二选一**：领域数据的隔离靠**独立 DB**（`sin90.db`，内核的 `agent24.db` 不认识这些表）；而共享**记忆底座**（M-D 的 EventLog / AssertionLedger / ArtifactStore）是所有模块共用的，那里的归属靠 **`(组织, 空间)` 所有权维度**（[ADR-030](docs/decision.md)）——模块拿到的句柄被钉死在自己的分区上，键做长度前缀编码，两个模块不可能读到对方的、也读不到用户自己的。
+**隔离是两层，不是二选一**：领域数据的隔离靠**独立 DB**（`sin90.db`，内核的 `agent24.db` 不认识这些表）；而共享**记忆底座**是所有模块共用的，那里的归属靠 **`(组织, 空间)` 所有权维度**（[ADR-030](docs/decision.md)）——模块拿到的 `ScopedMemory` 句柄被钉死在自己的分区上，键对 org 与 space 都做长度前缀编码。
+
+> **这是句柄的性质，不是沙箱。** 领域 OS 今天编译进 daemon，与内核同进程同权限：它绕开句柄直接打开那个 sqlite 文件，上面每一条都不成立（`ScopedMemory` 的文档自己就这么写）。「读不到用户自己的记忆」还有一个前提——用户 id 不以 `v2\0` 开头；今天成立是因为 daemon 的用户 id 是常量 `local`。
+> 另外，模块句柄当前只暴露 `EventLog`，**没有**暴露 AssertionLedger / ArtifactStore。
 
 ### 领域 OS 开发（Rust `DomainModule`，[ADR-029](docs/decision.md)）
 
 ```rust
-trait DomainModule {                                  // 单向：模块用内核，内核不认识模块
-    fn name(&self) -> &str;
-    fn manifest(&self) -> &DomainOsManifest;          // domain-os.yml
-    async fn open_store(&self, dir: &Path) -> R<()>;  // 自己的 DB + 迁移
-    fn routes(&self, ctx: KernelCtx) -> axum::Router; // 自己的命名空间
-    fn event_module(&self) -> &str;
+// rust/crates/agent24-domain/src/lib.rs —— 单向：模块用内核，内核不认识模块
+#[async_trait::async_trait]
+pub trait DomainModule: Send + Sync {
+    fn manifest(&self) -> &DomainOsManifest;              // 清单是模块的唯一身份：
+                                                          // 故意没有 name() / event_module()，
+                                                          // 免得 trait 方法与已校验的清单不一致
+    async fn open_store(&self, dir: &Path) -> Result<()>; // 自己的 DB + 自己的迁移
+    fn routes(&self, ctx: Arc<dyn KernelCtx>) -> axum::Router;
+                                                          // 相对自己的命名空间（/directions，
+                                                          // 不是 /api/v1/sin90/directions）
 }
 
-trait KernelCtx {
-    fn events(&self) -> EventSink;                     // ✅ 已授予（只能发自己 module 的事件）
-    fn memory(&self, scope, grants) -> ScopedMemory;   // ✅ 已授予（只能碰自己分区）
-    // models() / scheduler() / policy()               // 🔲 已声明，尚未授予：没有 handle 可给
+pub trait KernelCtx: Send + Sync {
+    fn events(&self) -> Option<&EventSink>;               // None = 没授予 Capability::Events
+    fn memory(&self) -> Option<&dyn ScopedMemory>;        // None = 没授予 Capability::Memory
+                                                          // 故意不收 scope / grants 参数：
+                                                          // 那是调用方可以挪动的边界
+    // models() / scheduler() / policy() 尚不存在 —— 可以在清单里请求
+    // Capability::{Models,Scheduler,Policy}，但 KernelCtx 上没有对应方法可拿
 }
 ```
 
-> 内核实授能力集是 `{Events, Memory}`（`rust/apps/agent24d/src/domain.rs` 的 `KERNEL_GRANTS`）。模块可以在清单里多要，`Grants::granting` 取交集——**多要无益**。
+> `KERNEL_GRANTS = {Events, Memory}` 是内核**最多愿意给**的（`rust/apps/agent24d/src/domain.rs`）。实际拿到多少还要看：模块自己在清单里请求了什么（`Grants::granting` 取 `requested ∩ willing`，**多要无益，不要也不会白给**），以及 memory 分区登记是否成功（失败则不给）。
 
 ### 能力模块开发（TS CapabilityModule，由 `node-daemon` 承载）
 
 ```ts
-// 实现 CapabilityModule 接口
+// packages/node-daemon/src/capabilities/base.ts
 export const myModule: CapabilityModule = {
-  id: 'my-capability',
+  manifest: {                       // 清单是必需的；没有顶层 id 字段
+    id: 'my-capability',
+    version: '0.1.0',
+    name: 'My Capability',
+    description: '…',
+    type: 'headless',               // ui | headless | hybrid
+    permissions: [],
+  },
   register(router, ctx) {
-    router.get('/api/capabilities/my-capability', (req, res) => {
-      // ctx.llm 可调用 LLM Gateway
-      res.end(JSON.stringify({ ok: true }))
-    })
+    // handler 收 RouteContext（params/query/body）并 return 结果，不是 (req, res)
+    router.get('/api/capabilities/my-capability', (rctx) => ({ ok: true }))
+    // ctx.llm 是注入的 LLM Gateway
   },
 }
 ```
+
+> `/api/capabilities/<id>` 是**惯例不是强制**——router 接受任意 path（CodeBox 就挂在 `/api/codebox/*`）。
 
 ### LLM 运行时（可在设置页切换）
 
@@ -171,11 +189,13 @@ cd rust && cargo build -p agent24d -p agent24-cli
 
 ## 二次开发者接口（现在就有的）
 
-**协议层是唯一真源，CI 有零漂移门**
+**协议层是真源；CI 的零漂移门覆盖「生成物 vs 协议文件」，不覆盖「daemon 实现 vs 协议文件」**
+
+> 说清边界：CI 校验 `packages/api-client` 与 `protocol/` 一致，并 lint openapi。它**不**校验 daemon 的实际路由与 yaml 一致——今天 `/api/v1/os`、`/api/v1/os/{name}` 就在 daemon 上而不在 yaml 里。openapi.yaml 目前是手写的。
 
 | 契约 | 位置 | 说明 |
 |---|---|---|
-| v1 REST | [`protocol/openapi.yaml`](protocol/openapi.yaml) | health · chat · models · usage · sessions · runs · approvals · schedules · tools · standing-grants · tool-overrides（+ 领域 OS 自己的命名空间） |
+| v1 REST | [`protocol/openapi.yaml`](protocol/openapi.yaml) | health · chat · models · usage · sessions · runs · approvals · schedules · shutdown · tools · standing-grants · tool-overrides · sin90 的 7 条 |
 | WS 事件 | [`protocol/events.schema.json`](protocol/events.schema.json) | 含 `ModuleEventPayload{module, kind, payload}` —— 领域模块触达事件流的唯一一条缝 |
 | 插件清单 | [`protocol/module.schema.json`](protocol/module.schema.json) | `ModuleManifest` |
 | 生成物 | `packages/api-client` · `packages/contract-tests` | TS SDK（CI 校验零漂移）；契约测试任何实现都能拿去跑 |
@@ -184,15 +204,16 @@ cd rust && cargo build -p agent24d -p agent24-cli
 
 ```bash
 agent24 daemon start|status|stop      # 进程管理（~/.agent24/daemon.json 供发现）
-agent24 service install|status        # macOS LaunchAgent：登录自启 + 自愈（24/7）
+agent24 service install|uninstall|status   # macOS LaunchAgent：登录自启 + 自愈（24/7）
 agent24 tui                           # runs / 事件流 / 审批队列
-agent24 os list|enable|disable        # 领域 OS 处置
+agent24 os list|enable|disable        # 领域 OS 处置（enable/disable 只改配置，
+                                      # 下次 daemon 启动才生效）
 agent24 mcp                           # 把 agent24d 自己变成 MCP server —— 外部 agent
                                       # 可以把任务跑在你的 agent24 上，风险动作仍在本机审批
 ```
 
 渠道：微信桥（`packages/wechat-bridge`）、Nostr 桥（`packages/nostr-bridge`，NIP-44 加密，驱动 agent-speaker 二进制，含入站活性探针）。
-约定：能力模块**不直接调 LLM API**，一律经 LLM Gateway（[ADR-019](docs/decision.md)）；权限在清单声明，安装时出同意摘要。
+约定（**是约定，不是运行时强制**）：能力模块应经注入的 LLM Gateway 调模型而不直连外部 API（[ADR-019](docs/decision.md)）。今天 node-daemon 不阻止模块自己 `fetch` 出去——模块是普通 npm 包，`require()` 进来后顶层代码就在宿主进程里跑；清单里的 permissions 目前只做结构校验与安装同意摘要，**不参与 dispatch 时的权限强制**。
 
 ---
 
@@ -206,12 +227,12 @@ agent24 mcp                           # 把 agent24d 自己变成 MCP server —
 | **M-B** Rust 内核 | agent24d · CLI · core / agent / models / scheduler / store / policy | ✅ |
 | **M-C** 发布 | v0.1.0 → v0.2.0 → **v0.3.0**（当前） | ✅ |
 | **M-H** 人机边界 | 审批门 · payload 哈希 · durable resume · plan mode · 安装同意摘要 · Fake 渠道 harness | ✅ |
-| **M-D** 记忆重做 | MD-1..MD-8 全交付：权威+投影 · 真双时相 · 治理写门 · Condenser（隐藏非删除）· 巩固循环 · FTS/向量缝 | ✅（`OmlxEmbedder` 待 D4b） |
-| **M-F** 渠道 | F3 微信 ✅ · F4 Nostr ✅（含入站活性探针）· F1b 托盘常驻 🔲 · **F5 7×24 泡测 🔲** | 🟡 |
+| **M-D** 记忆重做 | 权威+投影 · 真双时相 · 治理写门 · Condenser · 巩固循环 · FTS/向量缝——**crate 层的库原语与迁移已落地，daemon 尚未端到端消费**（巩固只有调用方驱动的 `run_once` 无后台循环；新 condenser 未接管现有 session 路径；`OmlxEmbedder` 只有 seam 无实现）。⚠️ `SPEC-MD-ME.md` 标 MD-1..8 全交付、`TASKS.md` 仍标 pending,**两份文档互相矛盾,待对账** | 🟡 |
+| **M-F** 渠道 | F3 微信 ✅ · F4 Nostr ✅ 桥侧代码与契约完成（含入站活性探针；依赖外部 `agent-speaker` daemon，加密 keystore 无法 headless 解锁——挂账在上游）· F1b 托盘常驻 ✅ · **F5 7×24 泡测 🔲** | 🟡 |
 | **M-E** 领域 OS | ME-1 `DomainModule`+`KernelCtx` ✅ · ME-2 配置注册表 + `os` CLI ✅ · **ME-3 进程外 Provider 🔲 设计中** · ME-4 第二个领域 OS（Cos72 骨架）🔲 · ME-5 PGL manifest 🔲 · ME-6 签名 + 信任根 🔲 | 🟡 |
 | **P4** 生态 / 分发 | 模块市场后端 ✅（npm 发现 + 浏览过滤）· 跨用户分发 / 模块签名 / 跨设备记忆同步 🔲 | 🟡 |
 
-**当前唯一的物理阻塞**：F5 —— 需要 Mac mini + 微信扫码 + Nostr identity 连跑 7 天；代码侧阻塞已清零。
+**当前唯一的物理阻塞**：F5 —— 需要 Mac mini + 微信扫码 + Nostr identity 连跑 7 天。启动 F5 所需的仓内代码已具备（这是一句限定，不是「全仓无待办」）。
 **下一步**：ME-3 设计定稿 → 实现 ME-3a..g → ME-4（用第二个领域 OS 证明「可替换」不是纸面性质）。
 
 **里程碑门**：进入 P4（跨用户分发、模块签名 + 信任根）与发布 tag/Release 需用户确认，不擅自跨。
