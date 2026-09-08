@@ -4,16 +4,19 @@
 >
 > ---
 >
-> ⚠️ **§0 的边界论述已被 ADR-029 / ADR-030 / ADR-031 取代**(本文写于三条 ADR 之前)。
+> ⚠️ **§0 的边界论述已被 ADR-029 / ADR-030 取代**(本文写于两条 ADR 之前),另有 ADR-031
+> (进程外领域 OS 的协议裁决)也管到这里——但 **ADR-031 尚未合并,在分支
+> `docs/me3-out-of-process` 上**,本文引用它时按未合并对待。
 > 三处以 ADR 为准,不以本文为准:
 >
 > 1. **缝是通用的,不是 Sin90 专属的。** §0 提出的 `Sin90KernelCtx` trait
->    **从未实现**(全仓零引用)。实际交付的是通用的 `DomainModule` + `KernelCtx`
+>    **从未实现**(`.rs` 里零引用,只在若干 .md 里被提到)。实际交付的是通用的 `DomainModule` + `KernelCtx`
 >    (ADR-029 / ME-1),Sin90 是它的第一个实现——这样 agent24d 才不必按名字
 >    认识 Sin90,第二个领域 OS 来时不用再抽一次。
 >    随之作废的还有 §0 那句「将来拆进程加个 RPC adapter 即可,**业务代码不动**」:
 >    进程外时 `(org, space)` 无法从长期连接得出,回调要带请求租约,业务代码要动
->    (见 `SPEC-ME3-OUT-OF-PROCESS.md` §3)。
+>    (见 `SPEC-ME3-OUT-OF-PROCESS.md` §3 —— **该文档尚未合并**,在分支
+>    `docs/me3-out-of-process` 上)。
 > 2. **能力清单对不上。** §0 说 ctx 给 `model()/scheduler()/events()/authz()`。
 >    内核**实授**的是 `KERNEL_GRANTS = {Events, Memory}`
 >    (`rust/apps/agent24d/src/domain.rs`)——model / scheduler / authz 一个都没给
