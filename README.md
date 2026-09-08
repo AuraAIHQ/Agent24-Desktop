@@ -10,8 +10,8 @@
 - **多端**：桌面已落地（Electron 参考壳，macOS / Windows / Linux 分发）；移动（iOS / Android）与 Web 规划中，同属 shell-agnostic——移动端计划各提供 Tauri 与 Expo / React Native 瘦壳示例（见 [ADR-027](docs/decision.md)）。daemon 与模型可不在端上（如跑在你的 Mac），移动 / Web 端做瘦壳、只经 HTTP/WS 协议远程消费
 - 后台 daemon + 用户交互一致性
 - 标准化能力模块接口（今天是 `packages/node-daemon` 的内部 `CapabilityModule`；对外 SDK 尚未发布）
-- AI 适配层（三级路由 + `ModelProvider` 缝）。**今天生产代码启动时从环境只构造 oMLX 与 Ollama 两个本地 provider**；`OMLX_URL` 可指向任意 OpenAI 兼容远端，但没有独立的 Claude provider，也没有运行时的设置页切换。iDoris 接入排在 P4 门后
-- 分层记忆（L0 KV → L3 ATIF 轨迹 + SkillBank）+ 自进化框架
+- AI 适配层（三级路由 + `ModelProvider` 缝）。**今天生产启动只走 `ModelRouter::from_env()`，构造 oMLX 与 Ollama 两个槽**；tier 按 URL 判定——非 loopback 的 `OMLX_URL` 会被重标为 `Remote`，好让 LocalOnly 的任务拒绝它而不是悄悄外泄。没有独立的 remote / lora 注册入口，没有 Claude provider，也没有运行时的设置页切换。iDoris 接入排在 P4 门后
+- 分层记忆：今天有 L0 KV、canonical session（阈值触发的摘要压缩），以及 M-D 落下的事件日志 / 断言账本 / artifact / condenser / 巩固等**库原语**。**L3 ATIF 轨迹、SkillBank、自进化框架尚未实现**（代码中无此符号），是目标态
 - 通过 **Hyphae 菌丝网络**（Nostr）与其他 agent 通信
 
 **应用方**（如小黑书、博客、社区工具等）从本框架 fork，搭载具体场景的能力模块。
@@ -39,7 +39,7 @@
 │          store · memory · policy · tools · mcp · protocol · sin90    │
 └──────────┬───────────────────────────────────────┬─────────────────┘
      契约：protocol/openapi.yaml + events.schema     │ REST
-     （单一来源 → packages/api-client TS SDK 自动生成，CI 校验漂移）
+     （两条生成链：REST 手写 openapi.yaml、WS 事件由 Rust 类型导出；两者共同生成 packages/api-client 的 TS 类型，CI 各有一道漂移门）
 ┌──────────▼──────────────────┐        ┌───────────▼──────────────────┐
 │ TS 能力模块 / 协议参考实现    │        │ Python ML Worker（规划）       │
 │ packages/node-daemon         │        │ Embedding · Whisper ·          │
@@ -92,7 +92,7 @@ DomainModule（Rust trait）             CapabilityModule（TS）
 | 回答的问题 | 这台 agent 是**什么产品** | 这台 agent **多会一件事** |
 | 数量 | 可同时挂多个（`mount_all` 遍历整个 catalogue；`os.json` 逐模块记 enabled，未列出的模块服从全局 `default`）；**当前 build 的 catalogue 里只有 `sin90` 一个** | 可装多个 |
 | 语言 / 宿主 | Rust，挂进 `agent24d` | TS，跑在 `packages/node-daemon` |
-| 自带数据库 | ✅ 框架给独立 DB + 独立迁移（如 `sin90.db`） | ❌ 框架不给；但模块是普通 npm 包，自己建库没人拦（无沙箱、permissions 不参与强制） |
+| 自带存储 | ✅ 内核分配一个**独立数据目录**并在 `open_store(dir)` 里交给模块；**数据库与迁移由模块自己实现**（Sin90 的选择是独立 SQLite `sin90.db`） | ❌ 框架不分配；模块是普通 npm 包，自己建库没人拦（无沙箱、permissions 不参与强制） |
 | 记忆分区 | ✅ 共享记忆底座里的私有分区 `(org, os:<name>)`——**经内核交出的 `ScopedMemory` 句柄**访问时模块间不可互读 | ❌ |
 | 路由命名空间 | `/api/v1/<name>/*`（由清单 name 派生，模块挂不到自己命名空间外；`RESERVED_KERNEL_SEGMENTS` 拦下撞内核顶级段的名字——同步靠一个扫源码字面量的测试，是检查不是结构保证） | `/api/capabilities/<id>`（惯例） |
 | 事件 | `EventBody::Module{module, kind, payload}` | — |
@@ -102,7 +102,7 @@ DomainModule（Rust trait）             CapabilityModule（TS）
 
 > 两者的权限词表今天是两套（`module.schema.json` 明确记着「词表统一推迟到 M-E」），这笔债未还。
 
-**隔离是两层，不是二选一**：领域数据的隔离靠**独立 DB**（`sin90.db`，内核的 `agent24.db` 不认识这些表）；而共享**记忆底座**是所有模块共用的，那里的归属靠 **`(组织, 空间)` 所有权维度**（[ADR-030](docs/decision.md)）——模块拿到的 `ScopedMemory` 句柄被钉死在自己的分区上，键对 org 与 space 都做长度前缀编码。
+**隔离是两层，不是二选一**：领域数据的隔离靠**模块自管的独立存储**（内核只分配目录；Sin90 用独立的 `sin90.db`，内核的 `agent24.db` 不认识这些表）；而共享**记忆底座**是所有模块共用的，那里的归属靠 **`(组织, 空间)` 所有权维度**（[ADR-030](docs/decision.md)）——模块拿到的 `ScopedMemory` 句柄被钉死在自己的分区上，键对 org 与 space 都做长度前缀编码。
 
 > **这是句柄的性质，不是沙箱。** 领域 OS 今天编译进 daemon，与内核同进程同权限：它绕开句柄直接打开那个 sqlite 文件，**「经句柄不可跨分区读取」这条保证就不再成立**（`ScopedMemory` 的文档自己就这么写）。独立 `sin90.db`、`(org, space)` 的键编码这些事实不受影响。「读不到用户自己的记忆」还有一个前提——用户 id 不以 `v2\0` 开头；今天成立是因为 daemon 的用户 id 是常量 `local`。
 > 句柄本身也很窄：只有 `remember` / `recall` / `recent` 三个方法，**不交出** `EventLog`、`KvStore` 或连接池，也没有 AssertionLedger / ArtifactStore。
@@ -138,12 +138,13 @@ pub trait KernelCtx: Send + Sync {
 
 ### 能力模块开发（TS CapabilityModule，由 `node-daemon` 承载）
 
-> 今天**没有对外发布的 SDK**：`CapabilityModule` 是 `packages/node-daemon` 的内部接口。加载器 `require()` 包的入口后，要求**包根直接带有 `manifest` 与 `register`**——所以别只 `export const myModule`，那样导出的是 `{ myModule }`，会被拒绝。
+> 今天**没有对外发布的 SDK**：`CapabilityModule` 只是 `packages/node-daemon` 的内部接口，那个包是 private、只有 `main: dist/server.js`、不导出类型入口——**第三方模块 import 不到它**，只能按下面的结构实现（仓内模块用相对路径 `../capabilities/base`）。
+> 加载器 `require()` 包的入口后要求**包根直接带有 `manifest` 与 `register`**，所以别只 `export const myModule`：那样导出的是 `{ myModule }`，会被拒绝。
 
 ```ts
-import type { CapabilityModule } from '@agent24/node-daemon/capabilities/base'
-
-const myModule: CapabilityModule = {
+// 仓内：import type { CapabilityModule } from '../capabilities/base'
+// 仓外：没有可 import 的类型，按结构实现即可
+const myModule = {
   manifest: {                       // 清单是必需的；没有顶层 id 字段
     id: 'my-capability',
     version: '0.1.0',
@@ -166,7 +167,7 @@ module.exports = myModule   // 包根必须直接是 { manifest, register }
 
 ### LLM 运行时
 
-> ⚠️ 下表是**目标形态**。今天 daemon 启动时按环境变量（`OMLX_URL` / `OMLX_API_KEY` / `DEFAULT_MODEL`）构造 oMLX + Ollama 两个 Local tier provider；remote/lora provider 需另行配置才加入。**没有运行时的设置页切换。**
+> ⚠️ 下表是**目标形态**。今天 daemon 启动时按环境变量（`OMLX_URL` / `OMLX_API_KEY` / `DEFAULT_MODEL`）只构造 oMLX + Ollama 两个槽，tier 按 URL 判定（非 loopback 的 `OMLX_URL` → `Remote`）；**没有独立的 remote / lora 注册入口，也没有运行时的设置页切换。**
 
 | 运行时 | 端点 | 说明 |
 |--------|------|------|
@@ -202,7 +203,8 @@ cd rust && cargo build -p agent24d -p agent24-cli
 
 > - **REST**：`protocol/openapi.yaml` 是**手写**的真源。
 > - **WS 事件**：真源是 Rust 类型 `agent24-protocol`，`events.schema.json` 由 `cargo run -p agent24-protocol --bin export-schema` **生成**。
-> - **CI 的零漂移门**只覆盖「`packages/api-client` vs `protocol/` 文件」，并 lint openapi。它**不**校验 daemon 的实际路由与 yaml 一致——今天 `/api/v1/os`、`/api/v1/os/{name}` 就在 daemon 上而不在 yaml 里。
+> - **CI 有两道零漂移门**：① Rust event 类型 → `events.schema.json`（`export-schema` 输出与文件 diff）；② `protocol/` → `packages/api-client` 生成物。另有 openapi 的 redocly lint。
+> - 它们**都不**校验 daemon 的实际路由与 yaml 一致——今天 `/api/v1/os`、`/api/v1/os/{name}` 就在 daemon 上而不在 yaml 里。
 
 | 契约 | 位置 | 说明 |
 |---|---|---|
