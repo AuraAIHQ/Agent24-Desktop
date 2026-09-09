@@ -6,7 +6,15 @@
 >
 > **状态**:🟢 MD-1 spike 已交付并冻结签名(见 §2.1);MD-2a/2b 权威层已合并。MD-1c 后向量实现/SQLite DDL 仍按各自 MD-x 落。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
 >
-> **进度**:✅ MD-1 · ✅ MD-2 · ✅ MD-3 · ✅ MD-4 · ✅ MD-5 · ✅ MD-6(机制;OmlxEmbedder 待 D4b)· ✅ MD-7 · ✅ MD-8 —— **M-D 主线 MD-1..8 全交付**(MD-X 拆 crate 按 Codex 收口:无真实边界不拆)。
+> **进度**:MD-1 ✅ · MD-2 ✅ · MD-3 ✅ · **MD-4 🟢** · **MD-5 🟢** · **MD-6 🟢** · MD-7 ✅ · MD-8 ✅(MD-X 拆 crate 按 Codex 收口:无真实边界不拆)。
+>
+> **两个符号的含义,别再压平**(FU-37):**✅ = 库原语交付且已被 daemon 端到端消费**;**🟢 = 库原语交付、有测试,但 daemon 还没接线**。下面 §3 的详表一直是这么标的,而本行此前把 🟢 一律写成 ✅、还加了一句「MD-1..8 全交付」—— 那句话让读者以为巩固循环在跑、向量召回在用。三条 🟢 各自缺什么,详表的 🔜 里写着;判据在这里,**带正对照,免得「命中 0」与「量具没工作」分不开**:
+>
+> | 条目 | 缺的那一半 | 可复跑判据 |
+> |---|---|---|
+> | MD-4 | bulk rollback + turn→candidate 抽取(详表已标为边界) | —— |
+> | MD-5 | **没有 daemon 后台巩固循环**,只有调用方驱动的 `run_once`;默认 synth 只按事件数量生成文字 | `rg -n 'consolidat' rust/apps/agent24d/src \| rg 'spawn\|interval\|loop'` → **0**;正对照 `rg -c 'memory' rust/apps/agent24d/src` 非 0 |
+> | MD-6 | **`OmlxEmbedder` 不存在**,只有 `Embedder` 缝与测试用 embedder | `rg -n '(struct\|impl)\s+OmlxEmbedder' rust/` → **0**;正对照 `rg -c 'Embedder' rust/` 非 0(证明量具看得见这个词,而裸搜 `OmlxEmbedder` 命中 3 处**全是注释**——只数命中会得出相反结论) |
 
 ---
 

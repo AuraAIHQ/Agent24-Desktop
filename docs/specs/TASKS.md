@@ -212,14 +212,12 @@ L0 KV（D1）、L1 会话压缩（D1+D5b）、三层路由（D2）全部 merged�
 
 > 原 M-D（L0-L1 + 三级路由）已达成，但作为**通用 agent 底座**要把记忆重做成**可进化/可替换/可组合**的分层模型。权威见 **[ADR-028](../decision.md)**（分层）+ **[ADR-029](../decision.md)**（内核↔领域 OS 边界）+ 实现蓝图 **[SPEC-MEMORY.md](SPEC-MEMORY.md)**。三级路由（模型侧）与记忆解耦，各走各的。
 
-| ID | 任务 | 依赖 | 状态 |
-|---|---|---|---|
-| MD-1 | **评测/恢复 spike**（Codex 收口:非只重命名 trait）：两投影器 over 事件流(recent-window + tail-preserving summary,**不删原始**,记 source IDs+版本+checkpoint) + 崩溃/重放测试 + 小语料(预算/关键事实/因果/投毒/跨 scope 泄漏)。过了再冻结 trait/拆 crate | D1 | pending（最先做） |
-| MD-2 | **L1 CoreMemory**：block get/append/replace/apply_patch，agent+人可编辑 | MD-1 | pending |
-| MD-3 | **L3 Semantic（FTS）**：`Fact` 双时相表 + `MemoryWriter`+`Retriever`，scope 隔离 | MD-2 | pending（落"跨会话记住"消费者时） |
-| MD-3b | 本地向量（可选）：`OmlxEmbedder` + SQLite 向量 + 两阶段 LLM writer | MD-3, D4b | pending |
-| MD-4 | **L4 知识/SkillBank**：markdown 权威 + 触发注入 + `memory rebuild` | MD-3 | pending |
-| MD-X | **crate 拆分** `memory-{core,episodic,semantic,knowledge}` + `MemoryStore` facade（可随 MD-1..4 渐进） | — | pending |
+> ⚠️ **本节的 MD-1..MD-4 / MD-X 是 2026-07 的旧编号旧计划,已被 [SPEC-MD-ME.md](SPEC-MD-ME.md) §3 取代**(FU-37)。
+> **同一个 ID 在两处指的不是同一件事** —— 例如这里的 `MD-2` 是「L1 CoreMemory」,而 SPEC-MD-ME 的 `MD-2` 是「EventStore + ArtifactStore」。照本节的编号去对状态,一定对不上。
+>
+> **M-D 的状态源是 [SPEC-MD-ME.md](SPEC-MD-ME.md) §3 的那张表**,不是这里。它用两个符号:**✅ = 库原语交付且已被 daemon 端到端消费**;**🟢 = 库原语交付、有测试,但 daemon 还没接线**。当前:MD-1/2/3/7/8 ✅,MD-4/5/6 🟢。
+>
+> 本节保留只为存档旧计划的措辞,**不再更新**。旧表原文见 git 历史(本 commit 的 parent)。
 
 **收敛依据**：调研 9 个 top 仓库（mem0/letta/cognee/graphiti/basic-memory + codex/cline/aider/openhands + Claude Code），对源码逐条核实，报告在研究目录（未提交）。
 
