@@ -152,7 +152,7 @@ canary 每 5 分钟一发、7 天两千次，打公共 relay 必然吃限流，�
 
 实测：切到本地 relay 后，canary **发得出去、daemon 收得到**（`hyphae-daemon.log` 里每条都有 `📨 New message ... a24-liveness-canary`），但桥**一条都确认不了**，`sent=73 confirmed=0 lost=61`，`state` 永远 `degraded`。
 
-**原因是 FU-33 记的那个上游竞态，本地 relay 让它 100% 触发**：
+**原因是 FU-33 记的那个上游竞态，本地 relay 让它几乎每次都触发**（**不是每次** —— 见下面的读数，别把它写成"永远"）：
 
 - `internal/messaging/agent.go:220` **先** `relay.Publish`，`:241` **才** `StoreOutgoingMessage`；
 - 而 store 用的是 `INSERT OR REPLACE`（`internal/storage/message.go:34`）；
@@ -160,20 +160,29 @@ canary 每 5 分钟一发、7 天两千次，打公共 relay 必然吃限流，�
 - daemon 的 `seen` 集合让它**永不重处理**那个 event id；
 - 那行于是对 `history inbox` **永远不可见** → canary 永远确认不了。
 
-硬证据（`~/.hyphae/messages.db`）：
+**读数，以及一处要更正的过度断言。** 本节上一版写「`confirmed` 永远是 0」——**被我自己的数据推翻了**，如实改：
 
 ```
-含 canary 的行：is_incoming=0 → 98 行 ｜ is_incoming=1 → 9 行
+桥的健康快照（跑了约 40 分钟后）：sent=105  confirmed=2  lost=94  degraded_transitions=2
+messages.db 含 canary 的行：      is_incoming=0 → 130 行 ｜ is_incoming=1 → 11 行
 ```
 
-那 9 条是早期打公共 relay 时、往返够慢、侥幸赢了竞态的。
+**赢面约 2%**，不是零。竞态是竞态，不是必然——本地 relay 只是把它推到几乎必输。
+
+**但结论不变，而且理由要说准**：`degraded_transitions=2` 就是判据 6 的失败条件本身。任何合理的 stale 阈值下，2% 的确认率都会让桥**反复进出 degraded**；一次 7 天的泡测会积累几十次 transition，而判据 6 要求它**在本次 run 内不增长**。所以不是「永远确认不了」，是「**确认率低到判据必然失败**」。
+
+> ⚠️ 这个读数**会随时间变**（桥还在跑，canary 还在写库），所以它不是可复现的定值。可复现的是**形状**：`is_incoming=0` 那一栏远大于 `=1`，且 `lost` 远大于 `confirmed`。复跑：
+> ```bash
+> sqlite3 ~/.hyphae/messages.db \
+>   "SELECT is_incoming, COUNT(*) FROM messages WHERE plaintext LIKE '%canary%' GROUP BY is_incoming"
+> ```
 
 **所以 relay 的选择不是「快 vs 慢」，是在两种失效之间选**：
 
 | 选项 | 失效 |
 |---|---|
 | 公共 relay（damus 等） | 限流 → `degraded` 是 relay 的错 |
-| 本地 minirelay | **竞态必发 → `confirmed` 永远是 0** |
+| 本地 minirelay | **竞态几乎必发 → 确认率约 2%,`degraded_transitions` 持续增长,判据 6 必挂** |
 | `relay.aastar.io` | 当前下线 |
 | **修上游** | 无失效 —— 见下 |
 
