@@ -128,8 +128,19 @@ pub type Result<T> = std::result::Result<T, DomainError>;
 /// A kernel capability a domain OS may request in its manifest. The kernel
 /// grants a SUBSET; a capability that was not granted must be unreachable — see
 /// [`KernelCtx`], where an ungranted capability has no handle at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// `non_exhaustive` because this list grows: `Approval` lands with ME-3e, and
+/// `Models` / `Scheduler` / `Policy` become real when their handles do. Without
+/// it, every added variant breaks an exhaustive `match` in any crate outside this
+/// one — a source-compatibility break shipped silently, because nothing in this
+/// repository matches exhaustively and CI therefore cannot see it.
+///
+/// It does NOT derive `Deserialize`. Reading a manifest with a strict enum turns
+/// an unrecognised capability into a serde message about a variant, which cannot
+/// carry the name of the offending capability in a form a caller can act on. See
+/// [`Capability::parse`] and `RawManifest`'s `kernel_capabilities`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Capability {
     /// Emit `EventBody::Module` events under the module's OWN name.
     Events,
@@ -144,7 +155,57 @@ pub enum Capability {
     Memory,
 }
 
+/// Every capability this build knows, in declaration order. The single place the
+/// list is written down, so `parse` and the `supported` list in an error cannot
+/// drift apart.
+pub const ALL_CAPABILITIES: &[Capability] = &[
+    Capability::Events,
+    Capability::Models,
+    Capability::Scheduler,
+    Capability::Policy,
+    Capability::Memory,
+];
+
+/// A capability string a manifest asked for that this build does not know.
+///
+/// A struct rather than a message, because the operator's next question is always
+/// "which one, and what were the choices?" — and a serde variant error can answer
+/// neither in a form a caller can read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCapability {
+    /// Exactly what the manifest said, unmodified. A typo is only findable if the
+    /// error shows the typo.
+    pub capability: String,
+    pub supported: Vec<&'static str>,
+}
+
+impl std::fmt::Display for UnknownCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown_capability: {:?} is not one of {}",
+            self.capability,
+            self.supported.join(", ")
+        )
+    }
+}
+
 impl Capability {
+    /// Map a manifest string onto a capability, naming what was wrong if it is not
+    /// one. Deliberately not `Deserialize`: serde's variant error says which
+    /// variants exist but not which STRING was rejected in a shape a caller can
+    /// use, and a manifest full of capabilities gives no clue which one it meant.
+    pub fn parse(s: &str) -> std::result::Result<Self, UnknownCapability> {
+        ALL_CAPABILITIES
+            .iter()
+            .copied()
+            .find(|c| c.as_str() == s)
+            .ok_or_else(|| UnknownCapability {
+                capability: s.to_owned(),
+                supported: ALL_CAPABILITIES.iter().map(|c| c.as_str()).collect(),
+            })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Capability::Events => "events",
@@ -197,8 +258,12 @@ struct RawManifest {
     requires_apis: Vec<String>,
     #[serde(default)]
     requires_deps: Vec<String>,
+    /// Collected as STRINGS and mapped afterwards. Deserializing straight into
+    /// `Vec<Capability>` makes an unrecognised entry a serde variant error, which
+    /// cannot be turned into [`UnknownCapability`] — the string it rejected is not
+    /// recoverable from the message.
     #[serde(default)]
-    kernel_capabilities: Vec<Capability>,
+    kernel_capabilities: Vec<String>,
     #[serde(default)]
     ui_entry: Option<String>,
     impl_kind: ImplKind,
@@ -411,6 +476,30 @@ impl DomainOsManifest {
             })
             .unwrap_or_default();
 
+        // Versions are dispatched EXPLICITLY, not by `<= current`. This is also what
+        // refuses `0`: versions start at 1, so `0` is not "older than v1" — there
+        // is no v1-minus, and a document declaring it means something this build
+        // cannot know. A dedicated `== 0` check was written here first and then
+        // removed: the match already rejected it, with a byte-identical message, so
+        // the check could not fail in any way the match did not. (A mutation found
+        // it — disabling the dedicated check killed no test, because the match was
+        // catching the case all along.) Today v1 is the
+        // only one, so the match has a single arm — but writing it as a match is
+        // the point: when v2 arrives it gets its own arm and its own struct, rather
+        // than v1 documents being quietly fed to whatever `RawManifest` has become.
+        // A shape that says "anything not newer than me is mine" cannot survive a
+        // field being renamed or retyped.
+        match declared_schema {
+            1 => {}
+            other => {
+                return Err(DomainError::ManifestUnsupported {
+                    module,
+                    requirement: format!("manifest schema v{other}"),
+                    supported: format!("v1..=v{MANIFEST_SCHEMA_VERSION}"),
+                });
+            }
+        }
+
         // ---- step two: the STRICT shape, now that the version is known-good ----
         let raw: RawManifest = serde_yaml::from_value(tree).map_err(|e| {
             // `from_value` is the RIGHT deserializer here but it has one real
@@ -500,13 +589,23 @@ impl DomainOsManifest {
             )));
         }
 
+        // Mapped here rather than during deserialization, so an unrecognised entry
+        // can say WHICH string it was and what the choices are. `deny_unknown_fields`
+        // catches a misspelled FIELD; this catches a misspelled VALUE, and until now
+        // the second produced a serde variant error naming every valid option except
+        // the one the author actually typed.
+        let mut caps = Vec::with_capacity(raw.kernel_capabilities.len());
+        for c in &raw.kernel_capabilities {
+            caps.push(Capability::parse(c).map_err(|e| DomainError::Manifest(e.to_string()))?);
+        }
+
         Ok(Self {
             name: raw.name,
             version: raw.version,
             requires_models: raw.requires_models,
             requires_apis: raw.requires_apis,
             requires_deps: raw.requires_deps,
-            kernel_capabilities: raw.kernel_capabilities,
+            kernel_capabilities: caps,
             ui_entry: raw.ui_entry,
             impl_kind: raw.impl_kind,
         })
@@ -914,6 +1013,62 @@ impl_kind: in_process_crate
     fn manifest_version_equal_to_ours_loads() {
         let yaml = format!("{SIN90_YAML}manifest_version: {MANIFEST_SCHEMA_VERSION}\n");
         assert!(DomainOsManifest::from_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_capability_names_itself_and_the_alternatives() {
+        // A misspelled capability used to produce serde's variant error, which
+        // lists every valid option EXCEPT the one the author typed — so the reader
+        // has to diff the list against their own file to find it. The error must
+        // carry the rejected string.
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [events, telepthy]",
+        );
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("telepthy"),
+            "the error must show the string that was rejected, or a typo is a \
+             scavenger hunt: {err}"
+        );
+        assert!(err.contains("unknown_capability"), "{err}");
+        // And the alternatives, or "it is not one of them" is unactionable.
+        assert!(err.contains("events") && err.contains("memory"), "{err}");
+    }
+
+    #[test]
+    fn the_capability_list_and_the_parser_cannot_drift() {
+        // `ALL_CAPABILITIES` feeds both `parse` and the `supported` list in the
+        // error. If a variant is added to the enum but not to the slice, it becomes
+        // unparseable while still being a legal value elsewhere — a split that
+        // produces "unknown_capability: memory" if it ever happened to `Memory`.
+        for c in ALL_CAPABILITIES {
+            assert_eq!(
+                Capability::parse(c.as_str()).unwrap(),
+                *c,
+                "{} round-trips through its own string",
+                c.as_str()
+            );
+        }
+        // Control: the parser is not simply accepting everything.
+        assert!(Capability::parse("definitely-not-a-capability").is_err());
+    }
+
+    #[test]
+    fn schema_version_zero_is_refused() {
+        // Versions start at 1, so `0` is not "older than v1" — there is no v1-minus.
+        // Accepting it would treat a document whose author meant something else as
+        // if it were unversioned.
+        let yaml = format!("{SIN90_YAML}manifest_version: 0\n");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        assert!(
+            matches!(err, DomainError::ManifestUnsupported { .. }),
+            "v0 is a version mismatch, not a malformed document: {err:?}"
+        );
+        // Control: v1 and absent both still load, so this did not just break the
+        // compatibility rule it sits beside.
+        assert!(DomainOsManifest::from_yaml(SIN90_YAML).is_ok());
+        assert!(DomainOsManifest::from_yaml(&format!("{SIN90_YAML}manifest_version: 1\n")).is_ok());
     }
 
     #[test]

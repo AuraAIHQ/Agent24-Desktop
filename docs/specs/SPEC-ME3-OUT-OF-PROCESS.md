@@ -516,7 +516,7 @@ notify        · **谁该看到它** —— 从 RequestContext 的 run/session/s
 | 3. `initialize` 带版本协商 | ✅ **ME-3b**（本轮补上；归 3b 而非 3c，因为它是 3b 判 ready 的前提） | 初稿只测了超长行/未授予能力/摘要不符,**没有任何版本负例**——已补版本矩阵 |
 | 4. 租约按每请求建、用独立的秘密头 | ⚠️ **本轮无法验收，标 F8c/F9 deferred** | 本轮不签发租约,「过期/请求结束/跨连接被拒」只能靠测试伪造租约表——**那正是 §3 刚否掉的「测试证明生产不存在的性质」。不计入 ME-3d。** 本轮只验一件事:协议里 `X-A24-Request-Lease` 这个位置存在且与 `X-A24-Request-Id` 是两个头 |
 | 5. `scoped` 是独立请求独立授予的能力 | 🟡 **本轮只验一半** | 可验:旧 manifest 的 `memory` 只映射成 `memory.private`。不可验:「新 daemon 支持 scoped + 有效租约 ⇒ 仍 forbidden」——两条都是 deferred 的生产路径,随门 4 一起标 F8c/F9 |
-| 6. manifest/capability schema 的版本与兼容 | ✅ ME-3a/3c | 老 daemon + 新 manifest 在**解析期**就失败,早于握手 —— 所以要验的是 manifest 的最低版本字段与未知 capability 的稳定错误形状,不是握手协商 |
+| 6. manifest/capability schema 的版本与兼容 | ✅ ME-3a（**分两次交付**：`manifest_version` / `min_daemon_protocol` / 两步解析先落地，未知 capability 的稳定错误形状、`#[non_exhaustive]`、显式版本派发在其后补齐 —— 第一次交付时的 commit 标题说「门 6」比代码强，那是一句没有测试守着的措辞） | 老 daemon + 新 manifest 在**解析期**就失败,早于握手 —— 所以要验的是 manifest 的最低版本字段与未知 capability 的稳定错误形状,不是握手协商 |
 
 > **offer set 必须随 handler 上线逐步扩展，不能一次性宣告。** 本文说 offer set 是 `{Memory, Events, Approval}`，那是 ME-3 **全部交付完成后**的状态。若 ME-3c 一上来就协商并授予这三条，而 `memory` 的 handler 要到 ME-3d、`approval` 要到 ME-3e 才有，中间就会出现**「已授予但方法不存在」**——正好违反本文自己反复援引的那条原则（授予一个没有 handle 的能力就是撒谎，§3）。
 >
