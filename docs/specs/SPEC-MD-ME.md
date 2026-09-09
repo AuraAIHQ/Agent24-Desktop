@@ -47,7 +47,11 @@
 > 1. 它**不经过判据里 `(struct|impl)\s+` 那一段**。那段要是写错了（少个 `\s+`、写成 `\s`），判据照样返回 0，而正对照照样绿 —— 它证明的是「这个词在这棵树里出现过」，不是「量具在工作」。
 > 2. `Embedder` 是 `OmlxEmbedder` 的子串，所以它命中的**正是判据要驳回的那两个文件**（`lib.rs`、`vector.rs`）。对照与被测同源，等于没对照。
 >
-> 换成 `(struct|impl)\s+VectorRetriever` → `vector.rs:97`，**同形状、同目录、同 crate**。而且那段正则确实承重：`vector.rs:103` 的 `impl<E: …> VectorRetriever<E>` **不**命中，因为 `impl` 后面是 `<` 不是空白。
+> 换成 `(struct|impl)\s+VectorRetriever` → `vector.rs:97`，**同形状、同目录、同 crate**。
+>
+> **那段正则在做筛选，有两个层次的证据，后一个更强**：
+> - *必要性*：`vector.rs:103` 的 `impl<E: …> VectorRetriever<E>` **不**命中（`impl` 后面是 `<` 不是空白）—— 证明它能拒掉东西；
+> - *筛选力*：裸词 `VectorRetriever` 命中 **8** 处，**加上形状只剩 1** —— 证明它拒掉的不是个别反例，而是绝大多数。
 >
 > **同理，两段式判据要小心「只抄第一段」**：MD-5 曾用 `rg 'consolidat' rust/apps/agent24d/src | rg 'spawn|interval|loop'`，而**第一段单独跑是非 0 的**（2 处，都是注释）。照抄命令但漏掉第二段的人会读出相反的结论。已换成 `.consolidator(` 计数。
 >
