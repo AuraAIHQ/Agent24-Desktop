@@ -326,20 +326,32 @@ async fn cmd_models() -> Result<(), String> {
 /// prints the result. If it ever needs to compute a path or check for a duplicate
 /// itself, the seam is in the wrong place and that logic belongs in the library.
 fn os_local(action: &OsAction) -> Option<Result<(), String>> {
-    let root = match state_file::state_dir() {
-        Some(dir) => agent24_os_packages::packages_root(&dir, false),
-        None => {
-            return Some(Err(
-                "HOME is not set, so there is no packages directory".to_owned()
-            ));
-        }
-    };
+    // The state dir is OPTIONAL here, and passing it as an option rather than
+    // resolving it first is the whole difference: `A24_OS_PACKAGES` is consulted
+    // before it, so a container or CI runner with the override set and no `HOME`
+    // installs into the directory it asked for. Resolving `state_dir()` first
+    // reimposed the `HOME` requirement that the override exists to lift, and
+    // reported it with a message identical to the one for "neither is set" —
+    // indistinguishable outputs for two situations, one of which was wrong.
+    let root =
+        match agent24_os_packages::resolve_packages_root(state_file::state_dir().as_deref(), false)
+        {
+            Ok(root) => root,
+            Err(e) => return Some(Err(format!("{e} (set HOME, or set A24_OS_PACKAGES)"))),
+        };
     match action {
         OsAction::Install { path } => Some(
             agent24_os_packages::install::install(path, &root)
                 .map(|dest| {
                     println!("installed {}", dest.display());
                     println!("  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start");
+                    // Said out loud because the isolation is deliberate and
+                    // therefore permanent: an ephemeral daemon (`agent24 chat`
+                    // with nothing running) resolves a different packages root
+                    // and will never see this package. Without this line the two
+                    // lines above are, for that user, a promise that never comes
+                    // true.
+                    println!("  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)");
                 })
                 .map_err(|e| e.to_string()),
         ),

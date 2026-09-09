@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 7] = [
+pub const PASSTHROUGH_VARS: [&str; 8] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -125,6 +125,11 @@ pub const PASSTHROUGH_VARS: [&str; 7] = [
     "A24_GUARDIAN_ALWAYS_REVIEW",
     "A24_APPROVAL_TIMEOUT_SECS",
     "A24_SCHEDULER_TICK_SECS",
+    // ME-3a. Missing it meant `agent24 os install` wrote to the override
+    // directory while the launchd-started daemon kept scanning
+    // `~/.agent24/packages` — and the CLI still printed "it takes effect at the
+    // next daemon start".
+    "A24_OS_PACKAGES",
 ];
 
 /// Snapshot the environment the daemon should run with.
@@ -328,22 +333,77 @@ mod tests {
         assert!(!p.contains("exec&<fs"));
     }
 
+    /// Every environment variable the daemon side READS must be in
+    /// `PASSTHROUGH_VARS`, because launchd hands a LaunchAgent none of the login
+    /// shell's environment.
+    ///
+    /// This scans the SOURCE instead of listing the names a second time. The list
+    /// it replaced was a hand-copy of the constant, so it could only fail if a
+    /// name were deleted from the constant — it could never notice one that was
+    /// never added, and that is how this list actually drifted: the daemon read
+    /// `A24_OS_PACKAGES` while the old test stayed green.
     #[test]
     fn passthrough_list_matches_what_the_daemon_actually_reads() {
-        // Guard against drift: these are the vars grepped out of the daemon.
-        for v in [
-            "OMLX_URL",
-            "OMLX_API_KEY",
-            "DEFAULT_MODEL",
-            "A24_GUARDIAN",
-            "A24_GUARDIAN_ALWAYS_REVIEW",
-            "A24_APPROVAL_TIMEOUT_SECS",
-            "A24_SCHEDULER_TICK_SECS",
-        ] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut found: Vec<String> = Vec::new();
+        let mut files = 0usize;
+        for dir in ["apps/agent24d/src", "crates"] {
+            walk_rs(&root.join(dir), &mut |path| {
+                files += 1;
+                let Ok(text) = std::fs::read_to_string(path) else {
+                    return;
+                };
+                for pat in ["env::var(\"", "env::var_os(\""] {
+                    let mut rest = text.as_str();
+                    while let Some(i) = rest.find(pat) {
+                        rest = &rest[i + pat.len()..];
+                        let Some(end) = rest.find('"') else { break };
+                        let name = &rest[..end];
+                        // HOME is not ours to forward: launchd sets it itself.
+                        let shouty = !name.is_empty()
+                            && name
+                                .chars()
+                                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                        if shouty && name != "HOME" {
+                            found.push(name.to_owned());
+                        }
+                    }
+                }
+            });
+        }
+        // Positive controls. A scan that reads nothing makes the loop below
+        // vacuous, and a renamed directory is exactly how that would happen with
+        // no symptom.
+        assert!(
+            files > 10,
+            "scanned only {files} files — the paths are wrong"
+        );
+        assert!(
+            found.iter().any(|v| v == "A24_OS_PACKAGES"),
+            "the scan did not find a variable known to be read: {found:?}"
+        );
+        found.sort();
+        found.dedup();
+        for v in &found {
             assert!(
-                PASSTHROUGH_VARS.contains(&v),
-                "{v} missing from passthrough"
+                PASSTHROUGH_VARS.contains(&v.as_str()),
+                "{v} is read by the daemon but is not in PASSTHROUGH_VARS; a \
+                 LaunchAgent-started daemon would never see it"
             );
+        }
+    }
+
+    fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path)) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk_rs(&p, f);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                f(&p);
+            }
         }
     }
 
