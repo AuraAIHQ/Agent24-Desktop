@@ -94,6 +94,24 @@ pub enum DomainError {
     Manifest(String),
     #[error("manifest too large: {0}")]
     ManifestTooLarge(String),
+    /// The manifest declares a schema version, or a minimum daemon protocol,
+    /// that THIS build does not support.
+    ///
+    /// Distinct from [`Self::Manifest`] ON PURPOSE. A future manifest hitting an
+    /// old daemon is not a malformed document — it is a version mismatch, and the
+    /// operator needs to be told which side is behind. Folding it into a generic
+    /// serde error is what ME-3's gate 6 exists to prevent: the strict
+    /// [`RawManifest`] would reject an unknown field with a message about that
+    /// field, never mentioning that the daemon is simply too old.
+    #[error(
+        "manifest requires {requirement} (this daemon supports {supported}) — \
+         module {module:?} needs a newer agent24d"
+    )]
+    ManifestUnsupported {
+        module: String,
+        requirement: String,
+        supported: String,
+    },
     #[error("invalid event: {0}")]
     InvalidEvent(String),
     #[error("module store: {0}")]
@@ -150,6 +168,17 @@ pub enum ImplKind {
     OutOfProcessProvider,
 }
 
+/// The `domain-os.yml` SCHEMA version this build understands.
+///
+/// A manifest that omits `manifest_version` is treated as **v1** — every manifest
+/// written before this field existed is a v1 manifest, and making the field
+/// required would break every one of them at once.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// The kernel↔module PROTOCOL version this build speaks. Separate from the schema
+/// version: a manifest can be v1 while the protocol moves, and vice versa.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+
 /// The wire shape of `domain-os.yml`. PRIVATE, and the only MANIFEST type that
 /// derives `Deserialize`, so a caller cannot skip validation by deserializing
 /// straight into the validated type. `deny_unknown_fields` turns a typo like
@@ -173,6 +202,20 @@ struct RawManifest {
     #[serde(default)]
     ui_entry: Option<String>,
     impl_kind: ImplKind,
+    /// Declared here ONLY so `deny_unknown_fields` does not reject the very
+    /// fields step one just read. Their values are consumed by
+    /// [`ManifestEnvelope`]; re-reading them here would be reading the same
+    /// document twice and proving nothing, so they are deliberately never used.
+    ///
+    /// `allow(dead_code)` rather than `_`-prefixing: the names must match the YAML
+    /// keys for `deny_unknown_fields` to accept them, and a rename attribute to
+    /// achieve that would hide which key each one guards.
+    #[serde(default)]
+    #[allow(dead_code)]
+    manifest_version: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    min_daemon_protocol: Option<u32>,
 }
 
 /// A VALIDATED `domain-os.yml`.
@@ -266,8 +309,160 @@ impl DomainOsManifest {
                 Self::MAX_YAML_BYTES
             )));
         }
-        let raw: RawManifest =
-            serde_yaml::from_str(yaml).map_err(|e| DomainError::Manifest(e.to_string()))?;
+        // Parse the TEXT exactly once, into an untyped tree; both steps below read
+        // that tree. Two `from_str` calls would be two parses, and YAML parsing is
+        // not free on hostile input: a 446-byte alias-expansion bomb measured
+        // ~171ms per parse on this machine (serde_yaml rejects it — after doing
+        // the work), so parsing twice doubles what an attacker gets for a document
+        // well under `MAX_YAML_BYTES`.
+        //
+        // It also removes a question this design would otherwise have to answer:
+        // whether two independent parses of the same text are guaranteed to agree.
+        // Reading one tree twice, they provably are.
+        // NOTE for the disk-loading commit (ME-3a's next piece): a BOM is a
+        // BYTE-level artefact, and this strip only covers the string that reaches
+        // this function. Today the only manifest source is `include_str!`, so the
+        // bytes arrive at compile time and this is enough. The moment a manifest
+        // is read from disk at runtime, that path needs its own BOM test through
+        // the real loader — a `format!("{BOM}{yaml}")` unit test knows nothing
+        // about `fs::read` + `from_utf8` or a `BufReader` in between. A UTF-16 BOM
+        // (FF FE) never reaches here at all: it fails earlier, in UTF-8 decoding,
+        // and deserves its own readable reason on that path.
+        //
+        // A UTF-8 BOM makes serde_yaml report "containing more than one document
+        // is not supported" — a sentence with nothing to do with the actual
+        // problem, and one a reader cannot act on. Windows editors write a BOM by
+        // default, so this is the likeliest way a hand-written manifest fails.
+        // Strip it: this gate exists to produce READABLE reasons, and letting the
+        // commonest authoring accident produce the least readable message defeats
+        // it. (Found by a library-level probe, then reproduced through this
+        // function.)
+        let tree: serde_yaml::Value = serde_yaml::from_str(yaml.trim_start_matches('\u{feff}'))
+            .map_err(|e| DomainError::Manifest(e.to_string()))?;
+
+        // ---- step one: TOLERANT read, only to reach the version gate ----
+        //
+        // Order is load-bearing. Deserializing the strict shape first means a
+        // manifest from the future dies on an unknown field, with a message about
+        // that field and no hint that the daemon is the thing that is out of date.
+        //
+        // Plain key lookups rather than a typed envelope struct: a struct would
+        // need `deny_unknown_fields` off to survive a future document, and then it
+        // would be a second shape to keep in sync with the first. Three lookups
+        // cannot drift.
+        // ABSENT and MALFORMED are different answers, and collapsing them is the
+        // very failure this gate exists to prevent: `as_u64()` returns `None` for
+        // a string, so `manifest_version: "3"` would read as "absent" → default 1
+        // → PASS the gate → then die in the strict shape on a type error naming
+        // the field. That is exactly the unreadable outcome gate 6 removes.
+        let field_u32 = |k: &str| -> Result<Option<u64>> {
+            match tree.get(k) {
+                // ABSENT only. `key:` with no value is PRESENT-but-empty, and it
+                // falls through to the error arm below — the last place this
+                // gate's own principle was still collapsing. Nobody writes an
+                // empty value to mean "v1": omitting the key already means that
+                // and is shorter, so in practice an empty value is a slip or a
+                // template's unfilled slot, and both want to be told now. (If a
+                // generator ever emits `key:` to mean "filled in later", that
+                // belongs on the generating side — the kernel must not read it
+                // as 1.)
+                None => Ok(None),
+                Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+                    DomainError::Manifest(format!("{k} must be a non-negative integer, got {v:?}"))
+                }),
+            }
+        };
+        let module = tree
+            .get("name")
+            .and_then(serde_yaml::Value::as_str)
+            // A manifest too broken to yield a name still has to produce a message
+            // better than a serde error, so the gate names it `<unnamed>` rather
+            // than refusing to run.
+            .unwrap_or("<unnamed>")
+            .to_owned();
+
+        let declared_schema = field_u32("manifest_version")?.unwrap_or(1);
+        if declared_schema > u64::from(MANIFEST_SCHEMA_VERSION) {
+            return Err(DomainError::ManifestUnsupported {
+                module,
+                requirement: format!("manifest schema v{declared_schema}"),
+                supported: format!("v{MANIFEST_SCHEMA_VERSION}"),
+            });
+        }
+        if let Some(min) = field_u32("min_daemon_protocol")?
+            && min > u64::from(DAEMON_PROTOCOL_VERSION)
+        {
+            return Err(DomainError::ManifestUnsupported {
+                module,
+                requirement: format!("kernel protocol >= {min}"),
+                supported: format!("<= {DAEMON_PROTOCOL_VERSION}"),
+            });
+        }
+
+        // Collected BEFORE the tree is consumed below. Cheap: one pass over the
+        // top-level map. Used only on the error path (see there for why).
+        let null_keys: Vec<String> = tree
+            .as_mapping()
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, v)| matches!(v, serde_yaml::Value::Null))
+                    .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // ---- step two: the STRICT shape, now that the version is known-good ----
+        let raw: RawManifest = serde_yaml::from_value(tree).map_err(|e| {
+            // `from_value` is the RIGHT deserializer here but it has one real
+            // cost: its errors carry no line/column, because the tree it walks has
+            // no positions. For a gate whose whole purpose is readable reasons,
+            // losing "at line 3 column 1" hurts.
+            //
+            // So on the ERROR PATH ONLY, re-read the text with `from_str` purely to
+            // borrow a better-located message. Two rules keep this safe:
+            //
+            //  - If `from_str` ACCEPTS what `from_value` rejected, discard it and
+            //    keep our error. The two disagree in ways where `from_str` is the
+            //    LOOSER one — it turns `name: ~` into the literal string "~", and
+            //    accepts `!!str 2` for a u32. Adopting its verdict would undo the
+            //    strictness this path was chosen for; we only ever borrow its prose.
+            //  - The cost is bounded: an expansion bomb never reaches here, because
+            //    it already failed at the `from_str::<Value>` above. Only documents
+            //    that parsed cleanly and then failed the SHAPE get the second read.
+            if let Some(located) =
+                serde_yaml::from_str::<RawManifest>(yaml.trim_start_matches('\u{feff}'))
+                    .err()
+                    .map(|located| located.to_string())
+            {
+                // Both facts are true and they do not compete: the borrowed
+                // message locates the FIRST thing serde tripped on, while a null
+                // field further up may be the reason the author is here at all.
+                // Reporting only the borrowed one sends them round a second lap.
+                return DomainError::Manifest(if null_keys.is_empty() {
+                    located
+                } else {
+                    format!("{located} — null-valued field(s): {}", null_keys.join(", "))
+                });
+            }
+            // Nothing to borrow. This is not the rare case — it is exactly the
+            // case that needs help most, because `from_str` only has a message to
+            // lend when IT also refuses, and it is the LOOSER of the two. So the
+            // situations where `from_value` is stricter are precisely the ones
+            // where its bare message stands alone, and that message names no
+            // field: `name: ~` alone yields "invalid type: unit value, expected a
+            // string" — no line, no field, in a document with five string fields.
+            //
+            // Recover the field name from the tree instead. A YAML null is the one
+            // value that reaches serde as a type error with nothing to identify it,
+            // so listing the null-valued keys is enough to point at the culprit —
+            // and it needs no second copy of the field list, which is the trap the
+            // version gate was written to avoid.
+            DomainError::Manifest(if null_keys.is_empty() {
+                e.to_string()
+            } else {
+                format!("{e} — null-valued field(s): {}", null_keys.join(", "))
+            })
+        })?;
 
         if !valid_name(&raw.name) {
             return Err(DomainError::Manifest(format!(
@@ -695,6 +890,311 @@ impl_kind: in_process_crate
         assert_eq!(m.impl_kind(), ImplKind::InProcessCrate);
         assert_eq!(m.kernel_capabilities(), &[Capability::Events]);
         assert_eq!(m.ui_entry(), None);
+    }
+
+    // ---- ME-3a gate 6: manifest schema / protocol versioning ----------------
+    //
+    // The property under test is NOT "a bad version is rejected" — the strict
+    // parse would reject it too, eventually, for the wrong reason. It is that a
+    // manifest from the FUTURE produces a message naming the VERSION rather than
+    // naming whichever unknown field happened to come first. See §3 gate 6 of
+    // SPEC-ME3-OUT-OF-PROCESS.md.
+
+    #[test]
+    fn manifest_without_a_version_is_v1_and_still_loads() {
+        // Every manifest written before the field existed. Making it required
+        // would break all of them at once, so absence MUST mean v1 — and it must
+        // not warn either, or upgrading the daemon lights up every module.
+        assert!(!SIN90_YAML.contains("manifest_version"));
+        let m = DomainOsManifest::from_yaml(SIN90_YAML).unwrap();
+        assert_eq!(m.name(), "sin90");
+    }
+
+    #[test]
+    fn manifest_version_equal_to_ours_loads() {
+        let yaml = format!("{SIN90_YAML}manifest_version: {MANIFEST_SCHEMA_VERSION}\n");
+        assert!(DomainOsManifest::from_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn manifest_from_the_future_names_the_version_not_a_stray_field() {
+        // The future manifest also carries a field this build has never heard of.
+        // That is the whole point: the STRICT shape would fail on `warp_drive`
+        // and say so, never mentioning that the daemon is simply too old.
+        let yaml = format!(
+            "{SIN90_YAML}manifest_version: {}\nwarp_drive: true\n",
+            MANIFEST_SCHEMA_VERSION + 1
+        );
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        match &err {
+            DomainError::ManifestUnsupported {
+                module,
+                requirement,
+                ..
+            } => {
+                assert_eq!(module, "sin90", "the operator needs to know WHICH module");
+                assert!(
+                    requirement.contains(&(MANIFEST_SCHEMA_VERSION + 1).to_string()),
+                    "requirement must name the version it wanted: {requirement}"
+                );
+            }
+            other => panic!("expected ManifestUnsupported, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("warp_drive"),
+            "the message must not blame the unknown field — that is the failure \
+             mode gate 6 exists to prevent: {msg}"
+        );
+    }
+
+    #[test]
+    fn min_daemon_protocol_above_ours_is_refused_with_both_numbers() {
+        let yaml = format!(
+            "{SIN90_YAML}min_daemon_protocol: {}\n",
+            DAEMON_PROTOCOL_VERSION + 1
+        );
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&(DAEMON_PROTOCOL_VERSION + 1).to_string())
+                && msg.contains(&DAEMON_PROTOCOL_VERSION.to_string()),
+            "both sides' versions must appear, or the operator cannot tell who is \
+             behind: {msg}"
+        );
+    }
+
+    #[test]
+    fn min_daemon_protocol_at_or_below_ours_loads() {
+        let yaml = format!("{SIN90_YAML}min_daemon_protocol: {DAEMON_PROTOCOL_VERSION}\n");
+        assert!(DomainOsManifest::from_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn an_unnamed_future_manifest_still_reports_a_version_error() {
+        // A manifest too broken to yield a name must still reach the version
+        // gate. Refusing to run the gate without a name would put us back where
+        // we started: an unreadable serde error.
+        let yaml = format!("manifest_version: {}\n", MANIFEST_SCHEMA_VERSION + 1);
+        match DomainOsManifest::from_yaml(&yaml).unwrap_err() {
+            DomainError::ManifestUnsupported { module, .. } => assert_eq!(module, "<unnamed>"),
+            other => panic!("expected ManifestUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_strict_shape_still_rejects_unknown_fields_at_a_supported_version() {
+        // The tolerant envelope must not have loosened step two. Same stray field
+        // as the future-manifest test, but at a version we DO support: now it is
+        // a genuine typo and must fail, naming the field.
+        let yaml = format!("{SIN90_YAML}warp_drive: true\n");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Manifest(_)),
+            "a stray field at a supported version is a malformed manifest, not a \
+             version mismatch: {err:?}"
+        );
+        assert!(err.to_string().contains("warp_drive"), "{err}");
+    }
+
+    #[test]
+    fn a_bom_does_not_turn_into_an_unreadable_reason() {
+        // Windows editors write a UTF-8 BOM by default, so this is the likeliest
+        // way a hand-written manifest fails. Untreated, serde_yaml calls it
+        // "containing more than one document is not supported" — a sentence about
+        // something that is not the problem. This gate's whole purpose is readable
+        // reasons; the commonest authoring accident must not produce the least
+        // readable message.
+        // The BOM must be ADJACENT to content. `SIN90_YAML` opens with a newline,
+        // so the obvious `format!("\u{feff}{SIN90_YAML}")` produces `<BOM>\n…`,
+        // which serde_yaml accepts — a test written that way passes with or
+        // without the fix. (It was written that way; a mutation run caught it.)
+        let with_bom = format!("\u{feff}{}", SIN90_YAML.trim_start_matches('\n'));
+        // Assert the SHAPE of the failure, not merely that one occurred. `is_err()`
+        // is satisfied by ANY error — a later edit that breaks this fixture's
+        // indentation would keep the precondition green while it silently began
+        // proving something else. That is the same disease as "the positive
+        // control is non-zero, so the instrument works".
+        let why = serde_yaml::from_str::<serde_yaml::Value>(&with_bom)
+            .expect_err("fixture must reproduce the BOM failure")
+            .to_string();
+        assert!(
+            why.contains("more than one document"),
+            "the fixture must reproduce THE MISLEADING MESSAGE this strip exists to \
+             prevent, not just some error. If upstream ever replaces it with a \
+             readable one, this fails first — and then the thing to delete is the \
+             workaround, not this test. Got: {why}"
+        );
+        let m = DomainOsManifest::from_yaml(&with_bom).unwrap();
+        assert_eq!(m.name(), "sin90");
+        // CRLF was NOT the trigger — pinned so a future "fix" does not go after
+        // the wrong character.
+        assert!(DomainOsManifest::from_yaml(&SIN90_YAML.replace('\n', "\r\n")).is_ok());
+    }
+
+    #[test]
+    fn a_version_that_is_not_an_integer_is_refused_by_name() {
+        // ABSENT and MALFORMED must not collapse. `Value::as_u64` returns None for
+        // a string, so without this check `manifest_version: "3"` reads as absent
+        // → defaults to 1 → PASSES the gate → dies later in the strict shape on a
+        // type error. That is precisely the unreadable outcome the gate removes,
+        // reached by a different road.
+        for bad in ["\"3\"", "!!str 3", "three", "-1"] {
+            let yaml = format!("{SIN90_YAML}manifest_version: {bad}\n");
+            let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("manifest_version"),
+                "the error must name the field, not the type mismatch it caused \
+                 downstream ({bad}): {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_yaml_null_is_not_accepted_as_the_literal_string_tilde() {
+        // Locks the reason `from_value` was chosen over `from_str` for the strict
+        // shape. Measured on serde_yaml 0.9.34:
+        //
+        //   from_str  : name: ~  →  Ok(name == "~")   ← a STRING whose content is "~"
+        //   from_value: name: ~  →  Err(invalid type: unit value, expected a string)
+        //
+        // The `from_str` outcome does not error, has the right type, and carries a
+        // wrong value — an error answer sitting inside the distribution of legal
+        // answers. If anyone ever switches this back to `from_str` (say, to regain
+        // line/column in errors), a module could be named "~". This test is what
+        // stops that from landing silently.
+        // Use `version`, NOT `name`. Under `from_str` a null `name` becomes the
+        // string "~" and is then caught by name validation — the same error
+        // VARIANT either way, so a test asserting the variant passes under both
+        // deserializers and proves nothing. (It was written that way; mutation 6
+        // — switching the strict parse back to `from_str` — killed nothing, which
+        // is how it was found.) `version` has no such second line of defence: "~"
+        // is non-empty, so it sails through and the manifest loads with a version
+        // of "~".
+        let yaml = SIN90_YAML.replace(r#"version: "0.2.1""#, "version: ~");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type"),
+            "a YAML null must be refused ON TYPE, never coerced to the string \
+             \"~\" and waved through: {err}"
+        );
+    }
+
+    #[test]
+    fn a_version_key_with_no_value_is_not_silently_v1() {
+        // PRESENT-but-empty is not ABSENT. This was the last place where the
+        // gate's own principle — keep those two apart — was still collapsing.
+        // Nobody writes `manifest_version:` to mean v1: omitting the key already
+        // means that and is shorter. So an empty value is a slip or an unfilled
+        // template slot, and both want to be told now rather than to be read as 1.
+        for key in ["manifest_version", "min_daemon_protocol"] {
+            let yaml = format!("{SIN90_YAML}{key}:\n");
+            let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains(key),
+                "an empty {key} must be refused BY NAME, not read as absent: {err}"
+            );
+        }
+        // Control: the absent case must still load, or this check has simply
+        // broken the compatibility rule it sits next to.
+        assert!(DomainOsManifest::from_yaml(SIN90_YAML).is_ok());
+    }
+
+    #[test]
+    fn a_located_message_also_carries_the_null_fields() {
+        // Both facts are true and they do not compete. The borrowed message
+        // locates the FIRST thing serde tripped on; a null field further up may be
+        // the reason the author is here at all. Reporting only the borrowed one
+        // sends them round a second lap — fix the stray field, run again, and only
+        // then meet the real culprit.
+        let yaml = format!(
+            "{}\nwarp_drive: true\n",
+            SIN90_YAML.replace(r#"version: "0.2.1""#, "version: ~")
+        );
+        let msg = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(
+            msg.contains("warp_drive"),
+            "the located message must survive: {msg}"
+        );
+        // Assert the MARKER, not the word "version". serde's own message lists the
+        // expected field names — `version` among them — so `contains("version")`
+        // is satisfied whether or not the null list was appended. (It was written
+        // that way; mutation 10 killed nothing, which is how it was found. Fourth
+        // time in this change: the assertion landed on a set wider than the
+        // property it claimed to test.)
+        assert!(
+            msg.contains("null-valued field(s): version"),
+            "the null field must ride along, or the author needs two laps: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_nameless_type_error_still_names_the_field() {
+        // The case the borrowed message cannot help with, and the one that needs
+        // help most: `from_str` is the LOOSER deserializer, so it only has a
+        // message to lend when it ALSO refuses — never in the situations where
+        // `from_value` is the stricter one. `version: ~` alone yields
+        // "invalid type: unit value, expected a string": no line, no field, in a
+        // document with five string fields.
+        let yaml = SIN90_YAML.replace(r#"version: "0.2.1""#, "version: ~");
+        let msg = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(msg.contains("invalid type"), "{msg}");
+        assert!(
+            msg.contains("version"),
+            "a type error with no field name is a scavenger hunt across every \
+             string field; the null-valued key must be named: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_shape_error_keeps_its_line_and_column() {
+        // `from_value` errors carry no position — the tree it walks has none. The
+        // error path re-reads the text with `from_str` PURELY to borrow a located
+        // message. Without that, this gate would be strictly better at judging and
+        // strictly worse at explaining, which is a poor trade for something whose
+        // stated purpose is readable reasons.
+        let yaml = format!("{SIN90_YAML}warp_drive: true\n");
+        let msg = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(msg.contains("warp_drive"), "{msg}");
+        assert!(
+            msg.contains("line") && msg.contains("column"),
+            "the message must locate the offending field, or a long manifest is a \
+             scavenger hunt: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_document_is_parsed_once_not_twice() {
+        // The property: BOTH steps read one tree, so they cannot disagree, and a
+        // hostile document is not paid for twice. There is no clean way to count
+        // parses from outside, so this asserts the observable consequence — the
+        // two shapes agree about a document that is legal for one reading and not
+        // the other. `serde_yaml` refuses duplicate keys outright (measured), so a
+        // document cannot present one `name` to the gate and another to the strict
+        // shape; this test pins that we depend on that refusal.
+        let dup = format!("{SIN90_YAML}name: impostor\n");
+        let err = DomainOsManifest::from_yaml(&dup).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate"),
+            "a second `name` must be refused by the parser, not silently resolved \
+             to one of the two — the version gate and the strict shape would then \
+             be reading different documents: {err}"
+        );
+    }
+
+    #[test]
+    fn the_version_gate_runs_before_the_size_check_does_not_regress() {
+        // Order matters the other way too: an oversized document must still be
+        // refused for its SIZE, not parsed by the tolerant envelope first.
+        let yaml = format!(
+            "{}\n{}",
+            SIN90_YAML,
+            "#".repeat(DomainOsManifest::MAX_YAML_BYTES)
+        );
+        assert!(matches!(
+            DomainOsManifest::from_yaml(&yaml).unwrap_err(),
+            DomainError::ManifestTooLarge(_)
+        ));
     }
 
     #[test]
