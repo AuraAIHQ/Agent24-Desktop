@@ -12,7 +12,9 @@
 //! that this function returned `Err` says nothing about what it left on disk, so
 //! the tests here snapshot the whole tree before and after and compare sets. The
 //! snapshot function is the INSTRUMENT for those tests, so it has negative
-//! controls of its own — see [`tests::the_snapshot_sees_each_kind_of_difference`].
+//! controls of its own — see `the_snapshot_sees_each_kind_of_difference` in this
+//! file's test module. (Not a rustdoc link: the test module does not exist in a
+//! doc build, so a link there is one that can never resolve.)
 
 // TEMPORARY, and it must not outlive the next commit. Nothing calls this yet:
 // the CLI that will (`agent24 os install`) is deliberately a separate change, so
@@ -24,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::os_discovery::MANIFEST_FILE;
+use crate::discovery::MANIFEST_FILE;
 use agent24_domain::DomainOsManifest;
 
 /// Why an install did not happen. Every variant means the packages root was left
@@ -71,7 +73,7 @@ impl std::fmt::Display for InstallError {
 /// copy-then-delete, and a failure mid-copy leaves exactly the partial state this
 /// design exists to prevent. That is a CONFIGURATION property, not a code one —
 /// it depends on where the staging directory landed on the operator's machine, so
-/// a test passing here says nothing about their disk. Hence [`same_device`] is
+/// a test passing here says nothing about their disk. Hence `same_device` is
 /// checked at runtime, not merely covered by a test.
 pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError> {
     // Read and validate BEFORE touching the destination. A source that will be
