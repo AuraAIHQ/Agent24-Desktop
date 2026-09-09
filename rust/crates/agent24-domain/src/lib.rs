@@ -447,13 +447,6 @@ impl DomainOsManifest {
             .to_owned();
 
         let declared_schema = field_u32("manifest_version")?.unwrap_or(1);
-        if declared_schema > u64::from(MANIFEST_SCHEMA_VERSION) {
-            return Err(DomainError::ManifestUnsupported {
-                module,
-                requirement: format!("manifest schema v{declared_schema}"),
-                supported: format!("v{MANIFEST_SCHEMA_VERSION}"),
-            });
-        }
         if let Some(min) = field_u32("min_daemon_protocol")?
             && min > u64::from(DAEMON_PROTOCOL_VERSION)
         {
@@ -476,8 +469,17 @@ impl DomainOsManifest {
             })
             .unwrap_or_default();
 
-        // Versions are dispatched EXPLICITLY, not by `<= current`. This is also what
-        // refuses `0`: versions start at 1, so `0` is not "older than v1" — there
+        // Versions are dispatched EXPLICITLY, not by `<= current`.
+        //
+        // A `> MANIFEST_SCHEMA_VERSION` gate used to sit above this and answer
+        // FIRST, so the future-manifest case — the entire reason this match exists
+        // — was still being decided by `<= current`, and the match only ever saw
+        // `0`. Nothing could tell: deleting that gate broke no test, because the
+        // one test for a future manifest ignored `supported` with `..`, and that is
+        // the only field where the two answers differed ("v1" vs "v1..=v1"). The
+        // gate is gone and that assertion is now made.
+        //
+        // This is also what refuses `0`: versions start at 1, so `0` is not "older than v1" — there
         // is no v1-minus, and a document declaring it means something this build
         // cannot know. A dedicated `== 0` check was written here first and then
         // removed: the match already rejected it, with a byte-identical message, so
@@ -1042,7 +1044,45 @@ impl_kind: in_process_crate
         // error. If a variant is added to the enum but not to the slice, it becomes
         // unparseable while still being a legal value elsewhere — a split that
         // produces "unknown_capability: memory" if it ever happened to `Memory`.
-        for c in ALL_CAPABILITIES {
+        // The list must be built from the ENUM, not read off the slice. Iterating
+        // `ALL_CAPABILITIES` only catches drift one way (a name in the slice that
+        // `parse` rejects); the direction this test's own comment names — a variant
+        // ADDED to the enum but not to the slice — is invisible to it, because the
+        // loop never sees that variant. Measured: adding a variant to the enum and
+        // to `as_str`, leaving the slice alone, kept every test green.
+        //
+        // The exhaustive `match` is the mechanism. `non_exhaustive` does not apply
+        // inside the defining crate, so a new variant makes this fail to COMPILE
+        // until it is listed here — and listing it here is what puts it in front of
+        // the assertion below.
+        let every_variant: Vec<Capability> = [
+            Capability::Events,
+            Capability::Models,
+            Capability::Scheduler,
+            Capability::Policy,
+            Capability::Memory,
+        ]
+        .into_iter()
+        .inspect(|c| {
+            // Forces the compiler to check this list is complete: adding a variant
+            // without adding it above breaks this match.
+            match c {
+                Capability::Events
+                | Capability::Models
+                | Capability::Scheduler
+                | Capability::Policy
+                | Capability::Memory => {}
+            }
+        })
+        .collect();
+
+        for c in &every_variant {
+            assert!(
+                ALL_CAPABILITIES.contains(c),
+                "{} is a variant but missing from ALL_CAPABILITIES — `parse` would \
+                 reject a legal capability while `as_str` still produces it",
+                c.as_str()
+            );
             assert_eq!(
                 Capability::parse(c.as_str()).unwrap(),
                 *c,
@@ -1085,12 +1125,23 @@ impl_kind: in_process_crate
             DomainError::ManifestUnsupported {
                 module,
                 requirement,
-                ..
+                supported,
             } => {
                 assert_eq!(module, "sin90", "the operator needs to know WHICH module");
                 assert!(
                     requirement.contains(&(MANIFEST_SCHEMA_VERSION + 1).to_string()),
                     "requirement must name the version it wanted: {requirement}"
+                );
+                // Assert `supported` too, and assert its SHAPE — a range, not a
+                // bare number. Ignoring this field with `..` is exactly what let a
+                // redundant second gate answer this case: the two paths produced
+                // different `supported` strings ("v1" vs "v1..=v1") and no test
+                // looked at the field where they differed.
+                assert_eq!(
+                    supported,
+                    &format!("v1..=v{MANIFEST_SCHEMA_VERSION}"),
+                    "the supported RANGE must be shown, and it must come from the \
+                     version dispatch — a bare number means something else answered"
                 );
             }
             other => panic!("expected ManifestUnsupported, got {other:?}"),
