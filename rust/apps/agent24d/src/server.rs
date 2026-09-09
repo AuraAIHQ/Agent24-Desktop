@@ -727,6 +727,13 @@ pub async fn serve(
                 .map_err(|e| e.to_string())
         }),
     }];
+
+    // ME-3a: the catalogue is no longer only what was compiled in. The merge is a
+    // free function so it can be tested without standing up a daemon — see
+    // `with_discovered`.
+    let packages_root = os_packages_root(&state_dir, ephemeral);
+    let catalogue = with_discovered(catalogue, &packages_root);
+
     let os_config_path =
         crate::os_config::config_path().ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let os_config = crate::os_config::OsConfig::load(&os_config_path);
@@ -958,9 +965,154 @@ pub async fn serve(
     result
 }
 
+/// Append packages found on disk to a build-time catalogue.
+///
+/// Everything the caller passes in is a build-time entry. Everything this adds
+/// was found on disk AFTER the binary was built, which is the only shape that can
+/// demonstrate "installing a third-party domain OS needs no kernel change" — a
+/// mock appended to the `vec!` in `serve` would prove nothing, because reaching
+/// that `vec!` means editing and rebuilding the daemon.
+///
+/// A discovered package is NOT constructed here, and cannot be: an out-of-process
+/// module has no Rust type, and the transport that would give it one is ME-3b. Its
+/// `build` closure returns an error naming that. The entry still reaches the
+/// mounter, is refused there by the check that already exists, and — the point —
+/// appears in `agent24 os list` with a reason.
+///
+/// **Order is load-bearing.** Discovered entries go AFTER the built-in ones, and
+/// `mount_all` claims names first-come-first-served, so a disk package cannot
+/// shadow a compiled-in module by taking its name. The second claimant gets an
+/// explicit refusal rather than silently winning.
+fn with_discovered(
+    mut catalogue: Vec<crate::domain::Installed>,
+    packages_root: &std::path::Path,
+) -> Vec<crate::domain::Installed> {
+    let scan = crate::os_discovery::scan(packages_root);
+    for r in &scan.refused {
+        tracing::warn!(
+            "domain OS package at {} was not loaded: {}",
+            r.dir.display(),
+            r.why
+        );
+    }
+    for d in scan.found {
+        let name = d.manifest.name().to_owned();
+        let version = d.manifest.version().to_owned();
+        let dir = d.dir.clone();
+        tracing::info!(
+            "discovered domain OS {name:?} v{version} at {}",
+            dir.display()
+        );
+        catalogue.push(crate::domain::Installed {
+            name,
+            version,
+            build: Box::new(move || {
+                Err(format!(
+                    "{} declares an out-of-process provider; that transport is not \
+                     implemented yet (ME-3b)",
+                    dir.display()
+                ))
+            }),
+        });
+    }
+    catalogue
+}
+
+/// Where installed domain-OS PACKAGES live — deliberately NOT the same root as
+/// their data.
+///
+/// Data lives in `~/.agent24/os/<name>/`, which the module owns and writes to.
+/// A package holds the manifest, and the manifest is what DECIDES the module's
+/// name, namespace and data directory. Putting the two in one tree would let a
+/// module rewrite its own identity at runtime by writing one file into the
+/// directory it was handed — so the manifest must live somewhere the module is
+/// not given a handle to.
+///
+/// `A24_OS_PACKAGES` overrides it. That is not a convenience: it is what lets a
+/// test install a package into a temp dir and prove the catalogue is read at
+/// startup rather than compiled in, WITHOUT rebuilding the binary.
+fn os_packages_root(state_dir: &std::path::Path, ephemeral: bool) -> std::path::PathBuf {
+    if let Some(over) = std::env::var_os("A24_OS_PACKAGES") {
+        return std::path::PathBuf::from(over);
+    }
+    if ephemeral {
+        // An ephemeral daemon must not read the real user's packages: it is used
+        // by tests and by `agent24 chat` with no daemon running, and silently
+        // mounting whatever the user happens to have installed would make those
+        // runs depend on machine state they never asked about.
+        return std::env::temp_dir().join(format!("agent24-ephemeral-pkgs-{}", std::process::id()));
+    }
+    state_dir.join("packages")
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    // ---- ME-3a: the wiring itself, not just the scanner ---------------------
+
+    fn pkg(root: &std::path::Path, name: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::os_discovery::MANIFEST_FILE),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: [events]\nimpl_kind: out_of_process_provider\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn built_in(name: &str) -> crate::domain::Installed {
+        crate::domain::Installed {
+            name: name.to_owned(),
+            version: "9.9.9".to_owned(),
+            build: Box::new(|| Err("built-in, not constructed in this test".to_owned())),
+        }
+    }
+
+    #[test]
+    fn a_package_placed_after_the_build_reaches_the_catalogue() {
+        // The scanner having found it is not the same claim as the daemon having
+        // USED it. This is the wiring, which was previously only assertable by
+        // reading `serve`.
+        let root = tempfile::tempdir().unwrap();
+        pkg(root.path(), "cos72");
+
+        let out = super::with_discovered(vec![built_in("sin90")], root.path());
+        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["sin90", "cos72"]);
+    }
+
+    #[test]
+    fn a_disk_package_cannot_shadow_a_built_in_module() {
+        // Order is the whole mechanism: `mount_all` claims names first-come,
+        // first-served, so a disk package named `sin90` must land AFTER the
+        // compiled-in one and lose. If discovery ever moved ahead of the built-ins
+        // — or the mounter's claim became last-wins — a dropped-in directory could
+        // take over a kernel module's namespace silently.
+        let root = tempfile::tempdir().unwrap();
+        pkg(root.path(), "sin90");
+
+        let out = super::with_discovered(vec![built_in("sin90")], root.path());
+        assert_eq!(out.len(), 2, "both entries exist; the mounter decides");
+        assert_eq!(out[0].version, "9.9.9", "the built-in must come FIRST");
+        assert_eq!(out[1].version, "0.1.0");
+    }
+
+    #[test]
+    fn discovery_failing_does_not_empty_the_built_in_catalogue() {
+        // A missing or unreadable packages root must not cost the user the modules
+        // that were compiled in. "No third-party packages" is the normal case.
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            std::path::Path::new("/nonexistent/agent24-packages"),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "sin90");
+    }
 
     use super::*;
     use http_body_util::BodyExt;
