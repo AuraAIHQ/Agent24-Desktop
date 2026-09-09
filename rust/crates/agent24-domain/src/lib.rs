@@ -319,6 +319,16 @@ impl DomainOsManifest {
         // It also removes a question this design would otherwise have to answer:
         // whether two independent parses of the same text are guaranteed to agree.
         // Reading one tree twice, they provably are.
+        // NOTE for the disk-loading commit (ME-3a's next piece): a BOM is a
+        // BYTE-level artefact, and this strip only covers the string that reaches
+        // this function. Today the only manifest source is `include_str!`, so the
+        // bytes arrive at compile time and this is enough. The moment a manifest
+        // is read from disk at runtime, that path needs its own BOM test through
+        // the real loader — a `format!("{BOM}{yaml}")` unit test knows nothing
+        // about `fs::read` + `from_utf8` or a `BufReader` in between. A UTF-16 BOM
+        // (FF FE) never reaches here at all: it fails earlier, in UTF-8 decoding,
+        // and deserves its own readable reason on that path.
+        //
         // A UTF-8 BOM makes serde_yaml report "containing more than one document
         // is not supported" — a sentence with nothing to do with the actual
         // problem, and one a reader cannot act on. Windows editors write a BOM by
@@ -930,10 +940,20 @@ impl_kind: in_process_crate
         // which serde_yaml accepts — a test written that way passes with or
         // without the fix. (It was written that way; a mutation run caught it.)
         let with_bom = format!("\u{feff}{}", SIN90_YAML.trim_start_matches('\n'));
+        // Assert the SHAPE of the failure, not merely that one occurred. `is_err()`
+        // is satisfied by ANY error — a later edit that breaks this fixture's
+        // indentation would keep the precondition green while it silently began
+        // proving something else. That is the same disease as "the positive
+        // control is non-zero, so the instrument works".
+        let why = serde_yaml::from_str::<serde_yaml::Value>(&with_bom)
+            .expect_err("fixture must reproduce the BOM failure")
+            .to_string();
         assert!(
-            serde_yaml::from_str::<serde_yaml::Value>(&with_bom).is_err(),
-            "this fixture must actually reproduce the BOM failure, or the test \
-             below proves nothing"
+            why.contains("more than one document"),
+            "the fixture must reproduce THE MISLEADING MESSAGE this strip exists to \
+             prevent, not just some error. If upstream ever replaces it with a \
+             readable one, this fails first — and then the thing to delete is the \
+             workaround, not this test. Got: {why}"
         );
         let m = DomainOsManifest::from_yaml(&with_bom).unwrap();
         assert_eq!(m.name(), "sin90");
