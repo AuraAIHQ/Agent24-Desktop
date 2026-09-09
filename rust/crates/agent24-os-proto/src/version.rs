@@ -279,6 +279,37 @@ mod tests {
         assert!(undeclared.to_string().contains("[7, 9]"));
     }
 
+    /// `KIND` is a string that goes on the wire, and it was the one answer in
+    /// this file the author picked freely: every other expected value is pinned
+    /// by a quotation from the SPEC, but nothing looked at this one. A mutation
+    /// proved it — misspelling it as `verison_mistmatch` turned the whole
+    /// workspace red 0 times, while the same measurement on `negotiate` turned it
+    /// red twice, so the count was not vacuous.
+    ///
+    /// It matters here more than its size suggests: this slice is the one that
+    /// sets the pattern for the four after it. A precedent that "a constant is
+    /// not an answer" is how 3b-1's `-32700` and 3b-2b's `-32600` /
+    /// `auth_failed` / `manifest_mismatch` would arrive unguarded too.
+    #[test]
+    fn the_wire_kind_is_the_one_the_spec_names() {
+        // SPEC-ME3 §8 (ME-3b row), verbatim — the same sentence quoted beside the
+        // empty-intersection cases above:
+        const SPEC: &str =
+            "交集为空 → 握手失败并把两边区间都放进错误（`-32000` + `version_mismatch`）";
+        assert!(
+            SPEC.contains(VersionMismatch::KIND),
+            "KIND is {:?}, which does not appear in the SPEC sentence that names it",
+            VersionMismatch::KIND
+        );
+        // Control: the assertion above must be able to fail. A `contains` against
+        // a long sentence passes for any short substring of it, so this pins that
+        // the check is not satisfied by an accident of the prose.
+        assert!(
+            !SPEC.contains("verison_mistmatch"),
+            "the control string was accidentally made to appear in the quotation"
+        );
+    }
+
     #[test]
     fn an_inverted_range_cannot_be_constructed() {
         // Not a range that fails to overlap — a range that cannot be true of
