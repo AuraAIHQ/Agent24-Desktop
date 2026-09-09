@@ -1,7 +1,7 @@
 //! ME-3a — where the catalogue comes from when it is not compiled in.
 //!
-//! Before this, [`crate::domain::Installed`] entries were a `vec![]` written by
-//! hand in `server.rs`. That made ME-3's headline acceptance — *installing a
+//! Before this, the daemon's `Installed` catalogue entries were a `vec![]`
+//! written by hand in `server.rs`. That made ME-3's headline acceptance — *installing a
 //! third-party domain OS requires no kernel change* — untestable in the only way
 //! that counts: a mock module dropped into the catalogue proved nothing, because
 //! reaching the catalogue meant editing and rebuilding the daemon.
