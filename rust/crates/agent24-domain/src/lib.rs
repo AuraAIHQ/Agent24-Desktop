@@ -100,9 +100,9 @@ pub enum DomainError {
     /// Distinct from [`Self::Manifest`] ON PURPOSE. A future manifest hitting an
     /// old daemon is not a malformed document — it is a version mismatch, and the
     /// operator needs to be told which side is behind. Folding it into a generic
-    /// serde error is what ME-3's gate 6 exists to prevent: the strict shape would
-    /// reject an unknown field with a message about that field, never mentioning
-    /// that the daemon is simply too old.
+    /// serde error is what ME-3's gate 6 exists to prevent: the strict
+    /// `RawManifest` shape would reject an unknown field with a message about that
+    /// field, never mentioning that the daemon is simply too old.
     #[error(
         "manifest requires {requirement} (this daemon supports {supported}) — \
          module {module:?} needs a newer agent24d"
