@@ -44,8 +44,23 @@ agent24 service install          # 装 LaunchAgent，登录即起、崩溃自拉
 agent24 service status           # 确认 running
 
 # 3) 造几条“日常”定时任务（泡测的负载——照你真实用途，至少覆盖各时段）
-#    经 CLI 或桌面端 Schedules 页建；例如每小时一条轻量 run、每天早/晚各一条。
-agent24 schedules list           # 确认 next_run_at 合理
+#    ⚠️ **`agent24 schedules` 这个子命令不存在**（2026-09-09 实测；CLI 只有
+#    chat/models/service/daemon/tui/os/mcp）。本文此前两处这么写，是错的。
+#    走 API 建（或桌面端 Schedules 页）：
+TOKEN=$(python3 -c "import json;print(json.load(open('$HOME/.agent24/daemon.json'))['token'])")
+PORT=$(python3 -c "import json;print(json.load(open('$HOME/.agent24/daemon.json'))['port'])")
+curl -s -X POST "http://127.0.0.1:$PORT/api/v1/schedules" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"soak-5min","enabled":true,
+       "spec":{"type":"every","secs":300},
+       "action":{"type":"agent_run",
+                 "prompt":"soak heartbeat: reply with the single word OK",
+                 "model_override":"Qwen3-0.6B-4bit"}}'
+curl -s "http://127.0.0.1:$PORT/api/v1/schedules" -H "Authorization: Bearer $TOKEN"   # 确认 next_run_at
+
+#    ⚠️ **必须至少建一条**：soak-monitor 要求 `schedule_min > 0` 才可能 PASS
+#    ——「没人建过 schedule 的泡测什么也证明不了」（脚本 :294 自己写着）。
+#    ⚠️ **钉死 model_override**：不钉的话 7 天里可能挑到 27B/35B，白烧内存和发热。
 
 # 4) 渠道授权（各一次）
 #    微信：起 wechat-bridge，首跑打印二维码，用微信扫码绑 bot（token 存本地，之后免扫）
@@ -74,11 +89,199 @@ pnpm --filter @agent24/wechat-bridge start   # 扫码
   - `agent msg` → `cat ~/.agent24/nostr-bridge-health-<identity>.json`，`last_error` 为 null 且 `canaries.sent` 在涨（canary 就是走这条命令发的）。
   - `profile publish` → 看桥的启动日志里有没有 `[nostr] ✅ 已注册能力,发布到 N 个 relay`；失败会打 `[nostr] 注册失败`。**它不会写进健康快照的 `last_error`**（那个字段只来自活性探针），所以别用它证明注册成功。
 
-- **泡测的 daemon 要关掉桌面通知和自动回复**：`hyphae daemon --notify=false --auto-reply=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音（按 5 分钟一发算；若把 `A24_NOSTR_CANARY_MS` 调小，次数按比例上升）；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
+- **泡测的 daemon 要关掉桌面通知**：`hyphae daemon --identity agent24 --notify=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音（按 5 分钟一发算；若把 `A24_NOSTR_CANARY_MS` 调小，次数按比例上升）；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
+
+  > **更正（2026-09-09 实测）**：`--auto-reply` 的默认值**已经是 `false`**（`hyphae daemon --help` 逐字确认），不需要显式关。本文此前写「`--notify=false --auto-reply=false`」并说两个都默认开着 —— 前半对，后半不对。
 
 - **桥和 daemon 必须watch 同一个 relay**。`hyphae daemon --relay X` 而桥 `A24_NOSTR_RELAY=Y` 的话，canary 发出去没人收 → 一直 `degraded`，而且症状和"通路真的死了"完全一样。
 
 - **launchd 不继承登录 shell 的环境变量**。凡是 daemon 需要的 env（`OMLX_URL`、`OMLX_API_KEY`、API keys、`A24_*`），必须写进 LaunchAgent plist 的 `EnvironmentVariables`，不能只 `export` 在 `~/.zshrc` 里——否则自启的 daemon 连不上模型。装完 `service install` 后核对 plist。
+
+### 🔴 起跑前必须解决：加密 keystore 会让 headless 完全走不通（R3，2026-09-09 实测撞上）
+
+**症状**：任何 identity 操作都提示输入密码，非交互下直接失败：
+
+```
+Keystore password:
+{"ok":false,"error":"other_error","message":"failed to read password: operation not supported by device"}
+```
+
+**原因**：`~/.hyphae/keystore.json` 一旦 `"encrypted": true`，`hyphae` 在**每一个** identity 子命令前都要解锁——**包括 `identity create` 本身**（`internal/identity/commands.go:57` 的 `if ks.Encrypted { PromptPassword(...) }`）。而 keystore 路径**无法覆盖**：`GetKeyStorePath()` 只用 `os.UserHomeDir()/.hyphae`，没有任何环境变量或旗标（`internal/identity/keystore.go:18-28`）。
+
+**检查**：
+
+```bash
+python3 -c "import json;d=json.load(open('$HOME/.hyphae/keystore.json'));print('encrypted =',d.get('encrypted'),'| identities =',list((d.get('identities') or {}).keys()))"
+```
+
+**处理**：
+
+- `encrypted = False` → 没事，直接建 identity。
+- `encrypted = True` **且 identities 为空** → 那个加密标记是某次失败尝试留下的，**移开重建**（零个 identity = 零把密钥，没有东西会丢；仍然先备份）：
+
+  ```bash
+  mv ~/.hyphae/keystore.json ~/.hyphae/keystore.json.bak.$(date +%Y%m%d-%H%M%S)
+  hyphae identity create --nickname agent24 --default --json    # 不带 --password ⇒ 不加密、不提示
+  ```
+
+  代码依据：只有 `ks.Encrypted` 为真才提示；全新 keystore 不带 `--password` 就落成不加密（`commands.go:57` 与 `:70` 两个分支）。
+- `encrypted = True` **且里面有 identity** → **停下问用户**。移开会丢真密钥。这种情况 headless 泡测走不通，要么用户提供一个无密码的独立 identity，要么等上游给非交互解锁（**R3**）。
+
+**验完这两条再往下**（都要 `{"ok":true,...}`，且第一条的 `data` **非空**）：
+
+```bash
+$A24_SPEAKER_BIN identity list --json
+$A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
+```
+
+### 🟢 relay：公共 relay 会限流，判据 6 会被第三方绑架（2026-09-09 实测）
+
+三条实测，都带正对照：
+
+| relay | 结果 |
+|---|---|
+| `wss://relay.aastar.io`（默认，iDoris 自己的） | **下线**。DNS 正常、TCP 443 通、WS 升级返回 **HTTP 530**（Cloudflare 源站不可达） |
+| `wss://relay.damus.io` | 第一次发成功，**接着连发三次全失败**（`503` + `publish: context deadline exceeded`）——限流 |
+| `ws://localhost:7447`（`bin/minirelay`） | ⚠️ **条件不明，与下文的 2% 不同源，不作为推荐依据** —— 见下 |
+
+canary 每 5 分钟一发、7 天两千次，打公共 relay 必然吃限流，于是 **`degraded` 会是 relay 的错而不是我们的错**，判据 6 被第三方可用性绑架。
+
+> **上表 minirelay 那行要单独说清楚，因为它和下文的 2% 在统计上不可能同源。** 那次读到的是 `sent=4 confirmed=3 lost=0`；若确认率真是 2%，4 次里 ≥3 次确认的概率是 **3.2×10⁻⁵**。所以那行背后有一个变量没被记下来。
+>
+> **取证做了，但没找到那个变量，如实写**：
+>
+> - **观测**：`messages.db` 里 11 条 `is_incoming=1` 的 canary，**8 条挤在 19:23–19:27 这 4 分钟**（间隔约 20 秒，正是探针 overdue 加速后的节奏，即那段时间**几乎每一条都确认了**），之后 40 分钟空白，再零星 2 条。不是随机分布，是**有条件的**。
+> - **`received_at − created_at`（lag）在窗口内是 0–25 秒**，与「daemon 每 30 秒醒一次、订阅 3 秒」的节律相符。
+> - **第 9 条（19:19:22）不属于这一簇，别把它并进去**：它的 lag 是 **115 秒**，是窗口内的 4–20 倍，且发生在切本地 relay 之前的 damus 时期。合并成「19:19–19:27 的 9 条」读起来更整齐，但会**盖掉「它不同源」这个信息**——而那正是本节要说的事。
+> - **[正对照 · 时间轴]** `is_incoming=0` 的 canary 有 **152 条，跨度 19:22:26 → 20:50:51**。这一格证明库里有一条长得多的时间轴，所以「8 条挤在 4 分钟」是**真的聚集**，不是「库只覆盖了这 4 分钟」造成的假象。**没有这一格，聚集与采样窗口分不开**——这与给命中数配正对照是同一个动作，只是换到时间维度上。（PR-Daemon 在 #154 补的。）
+> - **一个被自己的数据证伪的假设**：我曾猜「经 daemon outbox 重发的 canary 会赢竞态（因为没有后续的 CLI 覆盖）」。对 event id 之后 —— daemon 日志里 12 条 `✅ Sent` 与**确认行、丢失行都零匹配**。**假设不成立，记下来免得下一个人再走一遍。**
+> - **仍未验证的假设**（PR-Daemon 提出，我没能证实也没能证伪）：真正的决定变量可能是**「daemon 那一刻有没有订阅同一条 relay」**，而不是「relay 在不在本地」。若真如此，选项表的三行全是**代理变量**，而那个真变量恰好是操作者能控制的 —— 它可能就是一个绕法（让 canary 走一条 daemon 不监听的 relay）。**在验证之前不要照这个思路配置泡测。**
+>
+> **所以 minirelay 那一行不作为任何推荐的依据。** 下面 2% 那组读数是在同一套配置上连续跑 40 分钟得到的，条件明确，以它为准。
+
+### ⛔ 但**别用本地 minirelay** —— 它会把一个上游竞态从偶发变成必然（2026-09-09 实测推翻了本节的上一版结论）
+
+本节上一版写「结论：F5 用本地 minirelay」。**那是错的，收回。**
+
+实测：切到本地 relay 后，canary **发得出去、daemon 收得到**（`hyphae-daemon.log` 里每条都有 `📨 New message ... a24-liveness-canary`），但桥**一条都确认不了**，`sent=73 confirmed=0 lost=61`，`state` 永远 `degraded`。
+
+**原因是 FU-33 记的那个上游竞态，本地 relay 让它几乎每次都触发**（**不是每次** —— 见下面的读数，别把它写成"永远"）：
+
+- `internal/messaging/agent.go:220` **先** `relay.Publish`，`:241` **才** `StoreOutgoingMessage`；
+- 而 store 用的是 `INSERT OR REPLACE`（`internal/storage/message.go:34`）；
+- 本地 relay 往返只要几毫秒，于是 **daemon 先把事件写成 `is_incoming=1`**，发送方的 CLI 随后 `INSERT OR REPLACE` **把它覆盖回 `is_incoming=0`**；
+- daemon 的 `seen` 集合让它**永不重处理**那个 event id；
+- 那行于是对 `history inbox` **永远不可见** → canary 永远确认不了。
+
+**读数，以及一处要更正的过度断言。** 本节上一版写「`confirmed` 永远是 0」——**被我自己的数据推翻了**，如实改：
+
+```
+桥的健康快照（跑了约 40 分钟后）：sent=105  confirmed=2  lost=94  degraded_transitions=2
+messages.db 含 canary 的行：      is_incoming=0 → 130 行 ｜ is_incoming=1 → 11 行
+```
+
+**赢面约 2%**，不是零。竞态是竞态，不是必然——本地 relay 只是把它推到几乎必输。
+
+**但结论不变，而且理由要说准**：`degraded_transitions=2` 就是判据 6 的失败条件本身。任何合理的 stale 阈值下，2% 的确认率都会让桥**反复进出 degraded**；一次 7 天的泡测会积累几十次 transition，而判据 6 要求它**在本次 run 内不增长**。所以不是「永远确认不了」，是「**确认率低到判据必然失败**」。
+
+> ⚠️ 这个读数**会随时间变**（桥还在跑，canary 还在写库），所以它不是可复现的定值。可复现的是**形状**：`is_incoming=0` 那一栏远大于 `=1`，且 `lost` 远大于 `confirmed`。复跑：
+> ```bash
+> sqlite3 ~/.hyphae/messages.db \
+>   "SELECT is_incoming, COUNT(*) FROM messages WHERE plaintext LIKE '%canary%' GROUP BY is_incoming"
+> ```
+
+**所以 relay 的选择不是「快 vs 慢」，是在两种失效之间选**：
+
+| 选项 | 失效 |
+|---|---|
+| 公共 relay（damus 等） | 限流 → `degraded` 是 relay 的错 |
+| 本地 minirelay | **竞态几乎必发 → 确认率约 2%,`degraded_transitions` 持续增长,判据 6 必挂** |
+| `relay.aastar.io` | 当前下线 |
+| **修上游** | 无失效 —— 见下 |
+
+**唯一干净的解法是修上游**，而它是一行 SQL：`StoreOutgoingMessage` 的 upsert 让 `is_incoming` **单调**，即 `ON CONFLICT ... DO UPDATE SET is_incoming = messages.is_incoming OR excluded.is_incoming`（或者干脆先落库再发布）。FU-33 早就记了这条，今天它从「理论上可能」变成「实测挡住了 F5」。
+
+**在上游修好之前**：用公共 relay，并把 `A24_NOSTR_CANARY_MS` 放大到 15 分钟以上以避开限流（相应放大 `A24_NOSTR_STALE_MS`）。这会降低活性探针的时间分辨率——**如实记下来**，别当成没有代价。
+
+```bash
+# ⛔ 别这么做 —— 见下一节:本地 relay 会让上游竞态 100% 触发,confirmed 永远是 0
+# nohup ~/Dev/auraai/agent-speaker/bin/minirelay 7447 &
+# A24_NOSTR_RELAY=ws://localhost:7447 ...
+
+# 上游修好前的做法:公共 relay + 放大 canary 间隔避开限流
+R=wss://relay.damus.io
+hyphae daemon --identity agent24 --notify=false --relay "$R"
+A24_NOSTR_RELAY="$R" A24_NOSTR_CANARY_MS=900000 A24_NOSTR_STALE_MS=2700000 \
+  pnpm --filter @agent24/nostr-bridge bridge
+```
+
+**代价要如实说**：本地 relay **测不到真实网络路径**（DNS、TLS、跨机 WS、睡眠后的连接僵尸）。它测的是「桥 ↔ hyphae daemon ↔ relay 这套机制本身活不活」。真实网络那一维要等 `relay.aastar.io` 恢复后单独补一轮——**别把本地 relay 跑绿了当成"Nostr 通路全程活着"**。
+
+### 🟡 模型运行时：没有它，判据 2 会挂
+
+```bash
+agent24 models        # 输出 "(no models — is a local LLM runtime running?)" 就是没有
+curl -s http://127.0.0.1:8088/v1/models | head -c 200
+```
+
+起法（`omlx start` 需要 GUI 的 oMLX.app；headless 用 `serve`，2026-09-09 实测可用）：
+
+```bash
+nohup omlx serve --port 8088 --api-key xiaobao8088 --memory-guard safe > ~/.agent24/omlx.log 2>&1 &
+agent24 models                                   # 要列出模型
+agent24 chat "reply with the single word OK" --model Qwen3-0.6B-4bit   # 端到端 2.4s
+```
+
+泡测的定时任务要调模型。**连续失败 5 次，daemon 会把 schedule 置 `enabled=false, next_run_at=null`**——行还在，调度器已死，而判据 2 明确把 `auto_disabled` 判为失败。所以起跑前 oMLX（或 Ollama / LM Studio）必须在跑。
+
+**且注意**：`agent24 service install` 捕获的 `EnvironmentVariables` **只有 `PATH`**（2026-09-09 实测）。`OMLX_URL` / `OMLX_API_KEY` 若非默认值，必须手工写进 plist，不能只 `export` 在 shell 里。默认值是 `http://127.0.0.1:8088` + key `xiaobao8088`（`agent24-models/src/router.rs` 的 `from_env`）。
+
+---
+
+## 在另一台机器上起跑（Mac mini 等）
+
+整套是**可复制粘贴**的，除了微信扫码那一步。
+
+```bash
+# 0) 克隆 + 装工具链
+git clone https://github.com/iDoris-ai/Agent24.git && cd Agent24
+# 需要：rustc/cargo、pnpm、以及 hyphae 二进制（从 iDoris-ai/hyphae 构建：cd cmd/hyphae && go build）
+
+# 1) 构建并安装（/usr/local/bin 若不可写才需要 sudo）
+cd rust && cargo build --release -p agent24d -p agent24-cli && cd ..
+cp rust/target/release/agent24 rust/target/release/agent24d /usr/local/bin/   # 两个都要
+
+# 2) 模型运行时先起（见上面 🟡）
+# 3) keystore 检查 + 建 identity（见上面 🔴）
+
+# 4) 常驻
+agent24 service install && agent24 service status
+agent24 daemon status
+
+# 5) Nostr 侧
+nohup hyphae daemon --identity agent24 --notify=false > ~/.agent24/hyphae-daemon.log 2>&1 &
+export A24_SPEAKER_BIN=$(which hyphae)
+nohup env A24_SPEAKER_BIN=$A24_SPEAKER_BIN A24_NOSTR_IDENTITY=agent24 \
+  pnpm --filter @agent24/nostr-bridge bridge > ~/.agent24/nostr-bridge.log 2>&1 &
+
+# 6) 桥起来 2-3 分钟后，确认 canary 真的被 relay 拉回来了
+cat ~/.agent24/nostr-bridge-health-agent24.json | python3 -m json.tool
+#    要看到 state=ok 且 canaries.confirmed > 0。
+#    confirmed 一直是 0 = 通路没通，这时**不要**继续放 7 天 ——
+#    先查桥与 daemon 是否 watch 同一个 relay。
+
+# 7) 微信（唯一需要人的一步）
+pnpm --filter @agent24/wechat-bridge start   # 首跑打印二维码，用微信扫
+
+# 8) 定时任务 + 冒烟 + 起跑
+curl -s "http://127.0.0.1:$PORT/api/v1/schedules" -H "Authorization: Bearer $TOKEN"
+scripts/soak-monitor.sh --interval 60 --duration 3600      # 先 1 小时冒烟
+nohup scripts/soak-monitor.sh --log ~/agent24-soak.jsonl > ~/soak-monitor.out 2>&1 &
+```
+
+> **两台机器同时跑是可以的，但必须各用各的 Nostr identity。** 同一个 npub 被两个桥用，两边的 canary 会互相被对方「确认」——活性判据就失去意义了：它证明的变成「某个桥的通路活着」，不是「这个桥的通路活着」。第二台机器建 identity 时换个 nickname，并把 `A24_NOSTR_IDENTITY` 指过去。
+
+---
 
 ## 起跑
 
