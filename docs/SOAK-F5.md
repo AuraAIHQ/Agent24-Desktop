@@ -74,11 +74,108 @@ pnpm --filter @agent24/wechat-bridge start   # 扫码
   - `agent msg` → `cat ~/.agent24/nostr-bridge-health-<identity>.json`，`last_error` 为 null 且 `canaries.sent` 在涨（canary 就是走这条命令发的）。
   - `profile publish` → 看桥的启动日志里有没有 `[nostr] ✅ 已注册能力,发布到 N 个 relay`；失败会打 `[nostr] 注册失败`。**它不会写进健康快照的 `last_error`**（那个字段只来自活性探针），所以别用它证明注册成功。
 
-- **泡测的 daemon 要关掉桌面通知和自动回复**：`hyphae daemon --notify=false --auto-reply=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音（按 5 分钟一发算；若把 `A24_NOSTR_CANARY_MS` 调小，次数按比例上升）；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
+- **泡测的 daemon 要关掉桌面通知**：`hyphae daemon --identity agent24 --notify=false`。桥每 5 分钟发一条 canary，daemon 会把它当成普通入站消息处理 —— `--notify` **默认是开的**，7 天会弹约 2000 次通知并播 2000 次提示音（按 5 分钟一发算；若把 `A24_NOSTR_CANARY_MS` 调小，次数按比例上升）；`--auto-reply` 开着还会为每条 canary 多产生一个 relay 事件。桥侧的过滤发生在这之后，挡不住这一层（FU-33 已记：上游应给探针留一个 tag 并跳过通知/自动回复）。
+
+  > **更正（2026-09-09 实测）**：`--auto-reply` 的默认值**已经是 `false`**（`hyphae daemon --help` 逐字确认），不需要显式关。本文此前写「`--notify=false --auto-reply=false`」并说两个都默认开着 —— 前半对，后半不对。
 
 - **桥和 daemon 必须watch 同一个 relay**。`hyphae daemon --relay X` 而桥 `A24_NOSTR_RELAY=Y` 的话，canary 发出去没人收 → 一直 `degraded`，而且症状和"通路真的死了"完全一样。
 
 - **launchd 不继承登录 shell 的环境变量**。凡是 daemon 需要的 env（`OMLX_URL`、`OMLX_API_KEY`、API keys、`A24_*`），必须写进 LaunchAgent plist 的 `EnvironmentVariables`，不能只 `export` 在 `~/.zshrc` 里——否则自启的 daemon 连不上模型。装完 `service install` 后核对 plist。
+
+### 🔴 起跑前必须解决：加密 keystore 会让 headless 完全走不通（R3，2026-09-09 实测撞上）
+
+**症状**：任何 identity 操作都提示输入密码，非交互下直接失败：
+
+```
+Keystore password:
+{"ok":false,"error":"other_error","message":"failed to read password: operation not supported by device"}
+```
+
+**原因**：`~/.hyphae/keystore.json` 一旦 `"encrypted": true`，`hyphae` 在**每一个** identity 子命令前都要解锁——**包括 `identity create` 本身**（`internal/identity/commands.go:57` 的 `if ks.Encrypted { PromptPassword(...) }`）。而 keystore 路径**无法覆盖**：`GetKeyStorePath()` 只用 `os.UserHomeDir()/.hyphae`，没有任何环境变量或旗标（`internal/identity/keystore.go:18-28`）。
+
+**检查**：
+
+```bash
+python3 -c "import json;d=json.load(open('$HOME/.hyphae/keystore.json'));print('encrypted =',d.get('encrypted'),'| identities =',list((d.get('identities') or {}).keys()))"
+```
+
+**处理**：
+
+- `encrypted = False` → 没事，直接建 identity。
+- `encrypted = True` **且 identities 为空** → 那个加密标记是某次失败尝试留下的，**移开重建**（零个 identity = 零把密钥，没有东西会丢；仍然先备份）：
+
+  ```bash
+  mv ~/.hyphae/keystore.json ~/.hyphae/keystore.json.bak.$(date +%Y%m%d-%H%M%S)
+  hyphae identity create --nickname agent24 --default --json    # 不带 --password ⇒ 不加密、不提示
+  ```
+
+  代码依据：只有 `ks.Encrypted` 为真才提示；全新 keystore 不带 `--password` 就落成不加密（`commands.go:57` 与 `:70` 两个分支）。
+- `encrypted = True` **且里面有 identity** → **停下问用户**。移开会丢真密钥。这种情况 headless 泡测走不通，要么用户提供一个无密码的独立 identity，要么等上游给非交互解锁（**R3**）。
+
+**验完这两条再往下**（都要 `{"ok":true,...}`，且第一条的 `data` **非空**）：
+
+```bash
+$A24_SPEAKER_BIN identity list --json
+$A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
+```
+
+### 🟡 模型运行时：没有它，判据 2 会挂
+
+```bash
+agent24 models        # 输出 "(no models — is a local LLM runtime running?)" 就是没有
+curl -s http://127.0.0.1:8088/v1/models | head -c 200
+```
+
+泡测的定时任务要调模型。**连续失败 5 次，daemon 会把 schedule 置 `enabled=false, next_run_at=null`**——行还在，调度器已死，而判据 2 明确把 `auto_disabled` 判为失败。所以起跑前 oMLX（或 Ollama / LM Studio）必须在跑。
+
+**且注意**：`agent24 service install` 捕获的 `EnvironmentVariables` **只有 `PATH`**（2026-09-09 实测）。`OMLX_URL` / `OMLX_API_KEY` 若非默认值，必须手工写进 plist，不能只 `export` 在 shell 里。默认值是 `http://127.0.0.1:8088` + key `xiaobao8088`（`agent24-models/src/router.rs` 的 `from_env`）。
+
+---
+
+## 在另一台机器上起跑（Mac mini 等）
+
+整套是**可复制粘贴**的，除了微信扫码那一步。
+
+```bash
+# 0) 克隆 + 装工具链
+git clone https://github.com/iDoris-ai/Agent24.git && cd Agent24
+# 需要：rustc/cargo、pnpm、以及 hyphae 二进制（从 iDoris-ai/hyphae 构建：cd cmd/hyphae && go build）
+
+# 1) 构建并安装（/usr/local/bin 若不可写才需要 sudo）
+cd rust && cargo build --release -p agent24d -p agent24-cli && cd ..
+cp rust/target/release/agent24 rust/target/release/agent24d /usr/local/bin/   # 两个都要
+
+# 2) 模型运行时先起（见上面 🟡）
+# 3) keystore 检查 + 建 identity（见上面 🔴）
+
+# 4) 常驻
+agent24 service install && agent24 service status
+agent24 daemon status
+
+# 5) Nostr 侧
+nohup hyphae daemon --identity agent24 --notify=false > ~/.agent24/hyphae-daemon.log 2>&1 &
+export A24_SPEAKER_BIN=$(which hyphae)
+nohup env A24_SPEAKER_BIN=$A24_SPEAKER_BIN A24_NOSTR_IDENTITY=agent24 \
+  pnpm --filter @agent24/nostr-bridge bridge > ~/.agent24/nostr-bridge.log 2>&1 &
+
+# 6) 桥起来 2-3 分钟后，确认 canary 真的被 relay 拉回来了
+cat ~/.agent24/nostr-bridge-health-agent24.json | python3 -m json.tool
+#    要看到 state=ok 且 canaries.confirmed > 0。
+#    confirmed 一直是 0 = 通路没通，这时**不要**继续放 7 天 ——
+#    先查桥与 daemon 是否 watch 同一个 relay。
+
+# 7) 微信（唯一需要人的一步）
+pnpm --filter @agent24/wechat-bridge start   # 首跑打印二维码，用微信扫
+
+# 8) 定时任务 + 冒烟 + 起跑
+agent24 schedules list
+scripts/soak-monitor.sh --interval 60 --duration 3600      # 先 1 小时冒烟
+nohup scripts/soak-monitor.sh --log ~/agent24-soak.jsonl > ~/soak-monitor.out 2>&1 &
+```
+
+> **两台机器同时跑是可以的，但必须各用各的 Nostr identity。** 同一个 npub 被两个桥用，两边的 canary 会互相被对方「确认」——活性判据就失去意义了：它证明的变成「某个桥的通路活着」，不是「这个桥的通路活着」。第二台机器建 identity 时换个 nickname，并把 `A24_NOSTR_IDENTITY` 指过去。
+
+---
 
 ## 起跑
 
