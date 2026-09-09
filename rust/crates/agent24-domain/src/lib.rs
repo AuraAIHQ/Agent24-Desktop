@@ -319,8 +319,16 @@ impl DomainOsManifest {
         // It also removes a question this design would otherwise have to answer:
         // whether two independent parses of the same text are guaranteed to agree.
         // Reading one tree twice, they provably are.
-        let tree: serde_yaml::Value =
-            serde_yaml::from_str(yaml).map_err(|e| DomainError::Manifest(e.to_string()))?;
+        // A UTF-8 BOM makes serde_yaml report "containing more than one document
+        // is not supported" — a sentence with nothing to do with the actual
+        // problem, and one a reader cannot act on. Windows editors write a BOM by
+        // default, so this is the likeliest way a hand-written manifest fails.
+        // Strip it: this gate exists to produce READABLE reasons, and letting the
+        // commonest authoring accident produce the least readable message defeats
+        // it. (Found by a library-level probe, then reproduced through this
+        // function.)
+        let tree: serde_yaml::Value = serde_yaml::from_str(yaml.trim_start_matches('\u{feff}'))
+            .map_err(|e| DomainError::Manifest(e.to_string()))?;
 
         // ---- step one: TOLERANT read, only to reach the version gate ----
         //
@@ -332,7 +340,19 @@ impl DomainOsManifest {
         // need `deny_unknown_fields` off to survive a future document, and then it
         // would be a second shape to keep in sync with the first. Three lookups
         // cannot drift.
-        let field_u32 = |k: &str| tree.get(k).and_then(serde_yaml::Value::as_u64);
+        // ABSENT and MALFORMED are different answers, and collapsing them is the
+        // very failure this gate exists to prevent: `as_u64()` returns `None` for
+        // a string, so `manifest_version: "3"` would read as "absent" → default 1
+        // → PASS the gate → then die in the strict shape on a type error naming
+        // the field. That is exactly the unreadable outcome gate 6 removes.
+        let field_u32 = |k: &str| -> Result<Option<u64>> {
+            match tree.get(k) {
+                None | Some(serde_yaml::Value::Null) => Ok(None),
+                Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+                    DomainError::Manifest(format!("{k} must be a non-negative integer, got {v:?}"))
+                }),
+            }
+        };
         let module = tree
             .get("name")
             .and_then(serde_yaml::Value::as_str)
@@ -342,7 +362,7 @@ impl DomainOsManifest {
             .unwrap_or("<unnamed>")
             .to_owned();
 
-        let declared_schema = field_u32("manifest_version").unwrap_or(1);
+        let declared_schema = field_u32("manifest_version")?.unwrap_or(1);
         if declared_schema > u64::from(MANIFEST_SCHEMA_VERSION) {
             return Err(DomainError::ManifestUnsupported {
                 module,
@@ -350,7 +370,7 @@ impl DomainOsManifest {
                 supported: format!("v{MANIFEST_SCHEMA_VERSION}"),
             });
         }
-        if let Some(min) = field_u32("min_daemon_protocol")
+        if let Some(min) = field_u32("min_daemon_protocol")?
             && min > u64::from(DAEMON_PROTOCOL_VERSION)
         {
             return Err(DomainError::ManifestUnsupported {
@@ -895,6 +915,49 @@ impl_kind: in_process_crate
              version mismatch: {err:?}"
         );
         assert!(err.to_string().contains("warp_drive"), "{err}");
+    }
+
+    #[test]
+    fn a_bom_does_not_turn_into_an_unreadable_reason() {
+        // Windows editors write a UTF-8 BOM by default, so this is the likeliest
+        // way a hand-written manifest fails. Untreated, serde_yaml calls it
+        // "containing more than one document is not supported" — a sentence about
+        // something that is not the problem. This gate's whole purpose is readable
+        // reasons; the commonest authoring accident must not produce the least
+        // readable message.
+        // The BOM must be ADJACENT to content. `SIN90_YAML` opens with a newline,
+        // so the obvious `format!("\u{feff}{SIN90_YAML}")` produces `<BOM>\n…`,
+        // which serde_yaml accepts — a test written that way passes with or
+        // without the fix. (It was written that way; a mutation run caught it.)
+        let with_bom = format!("\u{feff}{}", SIN90_YAML.trim_start_matches('\n'));
+        assert!(
+            serde_yaml::from_str::<serde_yaml::Value>(&with_bom).is_err(),
+            "this fixture must actually reproduce the BOM failure, or the test \
+             below proves nothing"
+        );
+        let m = DomainOsManifest::from_yaml(&with_bom).unwrap();
+        assert_eq!(m.name(), "sin90");
+        // CRLF was NOT the trigger — pinned so a future "fix" does not go after
+        // the wrong character.
+        assert!(DomainOsManifest::from_yaml(&SIN90_YAML.replace('\n', "\r\n")).is_ok());
+    }
+
+    #[test]
+    fn a_version_that_is_not_an_integer_is_refused_by_name() {
+        // ABSENT and MALFORMED must not collapse. `Value::as_u64` returns None for
+        // a string, so without this check `manifest_version: "3"` reads as absent
+        // → defaults to 1 → PASSES the gate → dies later in the strict shape on a
+        // type error. That is precisely the unreadable outcome the gate removes,
+        // reached by a different road.
+        for bad in ["\"3\"", "!!str 3", "three", "-1"] {
+            let yaml = format!("{SIN90_YAML}manifest_version: {bad}\n");
+            let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("manifest_version"),
+                "the error must name the field, not the type mismatch it caused \
+                 downstream ({bad}): {err}"
+            );
+        }
     }
 
     #[test]
