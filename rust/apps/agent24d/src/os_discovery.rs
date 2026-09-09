@@ -91,7 +91,35 @@ pub fn scan(root: &Path) -> Scan {
     for e in entries.filter_map(std::result::Result::ok) {
         let path = e.path();
         match e.file_type() {
-            Ok(t) if t.is_dir() => dirs.push(path),
+            Ok(t) if t.is_dir() => {
+                // A dot-prefixed directory is never a package. This is not tidiness:
+                // `install` stages into `.staging-<name>-<pid>-<seq>` INSIDE this
+                // very root, so a crash leaves a HALF-COPIED package here — with a
+                // valid manifest, because the manifest is copied first. Worse,
+                // `.` (0x2E) sorts before every letter, so after `dirs.sort()` the
+                // wreckage reaches `mount_all` BEFORE the real package and wins the
+                // name claim (first-come-first-served). The operator then sees the
+                // real package refused as a duplicate, which reads as if the real
+                // one were the intruder.
+                //
+                // Refused rather than skipped, for the reason the symlink arm gives:
+                // an entry that is neither found nor refused makes a cause of an
+                // empty catalogue that nobody can see.
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+                {
+                    out.refused.push(Refused {
+                        dir: path,
+                        why: "dot-prefixed directory; not a package (install debris \
+                              looks like this — remove it)"
+                            .to_owned(),
+                    });
+                } else {
+                    dirs.push(path);
+                }
+            }
             Ok(t) if t.is_symlink() => out.refused.push(Refused {
                 dir: path,
                 // Refused rather than followed, for the reason the manifest-level
@@ -433,6 +461,60 @@ mod tests {
         assert!(
             scan.found.iter().any(|d| d.manifest.name() == "good"),
             "the good package must still load"
+        );
+    }
+
+    #[test]
+    fn install_debris_is_not_discovered_as_a_package() {
+        // A daemon killed mid-install leaves `.staging-<name>-<pid>-<seq>` in this
+        // very root, and it contains a VALID manifest — the manifest is copied
+        // first, so the wreckage parses. Worse, `.` (0x2E) sorts before every
+        // letter, so after `dirs.sort()` the wreckage reaches `mount_all` ahead of
+        // the real package and wins the name claim (first-come-first-served). The
+        // operator then sees the REAL package refused as a duplicate, which reads
+        // as though the real one were the intruder.
+        let root = tempfile::tempdir().unwrap();
+        install(
+            root.path(),
+            ".staging-cos72-99999-0",
+            &manifest_yaml("cos72", "out_of_process_provider").replace("0.1.0", "0.0.1"),
+        );
+        install(
+            root.path(),
+            "cos72",
+            &manifest_yaml("cos72", "out_of_process_provider"),
+        );
+        install(
+            root.path(),
+            "alpha",
+            &manifest_yaml("alpha", "out_of_process_provider"),
+        );
+
+        let scan = scan(root.path());
+        let found: Vec<(&str, &str)> = scan
+            .found
+            .iter()
+            .map(|d| (d.manifest.name(), d.manifest.version()))
+            .collect();
+
+        assert!(
+            !scan.found.iter().any(|d| d
+                .dir
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))),
+            "debris must not be discovered as a package: {found:?}"
+        );
+        // The real package must be the one that survives, at its real version.
+        assert!(found.contains(&("cos72", "0.1.0")), "{found:?}");
+        // Control: an ordinary package is still found, so "nothing is found" cannot
+        // satisfy the assertion above.
+        assert!(found.contains(&("alpha", "0.1.0")), "{found:?}");
+        // And it is REFUSED, not silently skipped — otherwise debris becomes an
+        // invisible cause of a confusing catalogue.
+        assert!(
+            scan.refused.iter().any(|r| r.why.contains("dot-prefixed")),
+            "{:?}",
+            scan.refused
         );
     }
 
