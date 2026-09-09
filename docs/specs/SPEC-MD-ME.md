@@ -4,9 +4,58 @@
 >
 > **定位澄清(关键)**:M-D 建的是**通用 agent 的记忆底座**,**不是把某个个人知识库(如 MemPalace)搬进内核**。方法是**借各家最佳实现之长**,能直接复用的 Rust 模块(如 codex 的 trait 形状)就复用。
 >
-> **状态**:🟢 MD-1 spike 已交付并冻结签名(见 §2.1);MD-2a/2b 权威层已合并。MD-1c 后向量实现/SQLite DDL 仍按各自 MD-x 落。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
+> **状态**:MD-1 spike 已交付并冻结签名(见 §2.1);MD-2a/2b 权威层已合并。(**本行不带符号** —— 符号在下面第 3 段有全局定义,这里再标一个会与那套定义打架。)MD-1c 后向量实现/SQLite DDL 仍按各自 MD-x 落。本文钉死:设计原则、数据结构形状、trait 契约、to-do+测试+验收、借鉴映射、技术标准。
 >
-> **进度**:✅ MD-1 · ✅ MD-2 · ✅ MD-3 · ✅ MD-4 · ✅ MD-5 · ✅ MD-6(机制;OmlxEmbedder 待 D4b)· ✅ MD-7 · ✅ MD-8 —— **M-D 主线 MD-1..8 全交付**(MD-X 拆 crate 按 Codex 收口:无真实边界不拆)。
+> **进度(按下面的定义逐行复核过,2026-09-09)**:MD-1 🟢 · **MD-2 🟡** · MD-3 🟢 · MD-4 🟢 · MD-5 🟢 · MD-6 🟢 · MD-7 🟢 · MD-8 🟢(MD-X 拆 crate 按 Codex 收口:无真实边界不拆)。
+>
+> **三个符号,别再压平**(FU-37):
+>
+> - **✅ = 库原语交付,且已被 daemon 端到端消费。** —— **今天一行都没有。**
+> - **🟡 = 部分接线**(只有 MD-2:它的 EventLog 那一半接了,ArtifactStore 那一半没有)。
+> - **🟢 = 库原语交付、有测试,但 daemon 还没接线。**
+>
+> **这一版是被 PR-Daemon 在 #152 挡下来才做对的,值得写下来**:本文上一版新定义了「✅ = 已被 daemon 端到端消费」,却**只拿它审了 MD-4/5/6,没有回头复核另外五行既有的 ✅**——于是一个更严的定义被套在五行没按它量过的标记上。这跟本文正在修的那个病是同一个:**定义改了,标记没跟着重算。**
+>
+> **复核用的判据(与任务名无关,量的是"内核到底调了没有")**:`KvStore` 的每个访问器在 `rust/apps`(agent24d + agent24-cli)里被调用的次数。
+>
+> | 访问器 / trait | `rust/apps` 命中 | 对应 |
+> |---|---|---|
+> | `.events(` / `EventLog` | **10 / 4** | MD-2 的一半 —— **唯一接线的东西** |
+> | `.artifacts(` / `ArtifactStore` | 0 / 0 | MD-2 的另一半 |
+> | `.assertions(` / `AssertionStore`,`.retriever(` / `Retriever` | 0 / 0 | MD-3 |
+> | `.consolidator(` / `Consolidator` | 0 / 0 | MD-5 |
+> | `.knowledge(` / `KnowledgeBase` | 0 / 0 | MD-7 |
+> | `.trace(` / `TaskTrace` | 0 / 0 | MD-8 |
+> | `.write_gate(` / `MemoryWriter` | 0 / 0 | MD-4 |
+>
+> **第二列还需要一格这张表自己没做的检查**（PR-Daemon 在 #152 补的）：**如果那个 trait 名根本不存在，它的 0 就与「量具没工作」分不开** —— 这正是 `OmlxEmbedder` 那条警告的坑，只是换到了列上。所以先验存在性：`EventLog` / `ArtifactStore` / `AssertionStore` / `Retriever` / `Consolidator` / `KnowledgeBase` / `TaskTrace` / `MemoryWriter` **每个在 `rust/` 里都有定义，全仓命中 2–31**。因此第二列的 0 是真的「`apps` 没用到」，不是名字打错了。复跑：
+>
+> ```bash
+> for t in EventLog ArtifactStore AssertionStore Retriever Consolidator KnowledgeBase TaskTrace MemoryWriter; do
+>   printf "%-16s 全仓=" "$t"; rg -c "\b$t\b" rust/ | awk -F: '{s+=$2} END {print (s?s:0)}'
+> done
+> ```
+>
+> **`.events(` 的 10 处就是正对照** —— 它证明这把量具看得见「已接线」长什么样,所以其余的 0 是真的 0,不是量具没工作。复跑:
+>
+> ```bash
+> for a in events artifacts assertions retriever knowledge trace consolidator write_gate; do
+>   printf "%-14s " ".$a("; rg -c "\.$a\(" rust/apps | awk -F: '{s+=$2} END {print (s?s:0)}'
+> done
+> ```
+>
+> **每条 🟢 缺的那一半**(§3 详表的 🔜 只写了「还想加什么」,没写「daemon 没调」,所以在这里补齐):
+>
+> | 条目 | 库原语 | 缺的那一半 |
+> |---|---|---|
+> | MD-1 | Condenser + replay 语料 | daemon 未调用 condenser;现用的 `CanonicalSession` 仍会丢弃折叠后的原文 |
+> | MD-2 | EventStore + ArtifactStore | **EventLog 已接**(os_memory 的模块分区走它);**ArtifactStore 未接** |
+> | MD-3 | AssertionStore + FTS Retriever | 两者 daemon 均未调用 |
+> | MD-4 | MemoryWriter 写门 | 写门本身未被 daemon 调用;另 bulk rollback + turn→candidate 抽取挂 MD-4b |
+> | MD-5 | Consolidator | **没有后台巩固循环**,只有调用方驱动的 `run_once`;默认 synth 只按事件数量生成文字 |
+> | MD-6 | Embedder 缝 + VectorRetriever | **`OmlxEmbedder` 不存在**(`(struct\|impl)\s+OmlxEmbedder` = 0;正对照 `Embedder` 命中 2 文件;**裸搜 `OmlxEmbedder` 命中 3 处全是注释** —— 只数命中会得出相反结论) |
+> | MD-7 | KnowledgeBase | daemon 未调用 |
+> | MD-8 | TaskTrace | daemon 未调用 |
 
 ---
 
@@ -143,17 +192,19 @@ trait ProjectionJob{ async fn run_from(&self, ckpt: CheckpointId)->R<ProjectionO
 ## 3. M-D to-do / 测试 / 验收
 
 > 分期跟消费者走;每条独立可发。"验收"= 该条合并的硬门槛。
+>
+> **ID 后面的符号按 §0 上方那套定义**(✅ 已接线 / 🟡 部分接线 / 🟢 库原语在但 daemon 未接)。**「验收」列里的 ✅ 是另一回事** —— 它说的是「这条的合并门槛过了」,与 daemon 有没有调它无关,两者不要混读。
 
 | ID | 交付 | 依赖 | 测试 | 验收 |
 |---|---|---|---|---|
-| **MD-1** ✅ | **评测/恢复 spike**:两个 `Condenser`(确定性 recent-window + 保留尾部 summary,发 `Condensation` view-delta,**不删原始**);建可回放语料 + benchmark 装载 | D1 | 崩溃/重启/幂等重放;语料测 token 预算/关键事实保留/因果/投毒排除/跨 scope 泄漏;LongMemEval 装载跑通 | ✅ 已交付(MD-1a #113 + MD-1b #116 + MD-1c):session 测试全绿 + 上述全过 + **签名已冻结(§2.1)** |
-| **MD-2** ✅ | **EventStore + ArtifactStore**(权威层):事件表 + markdown-CAS + 双谱系对账(checksum 移动检测) | MD-1 | 事件 append/scan/checkpoint 幂等;CAS 拒陈旧写;外部改文件→对账不静默删;rebuild 从事件重建投影 | ✅ 2a EventStore(#114)· ✅ 2b ArtifactStore(#115)· ✅ 2c 对账(`reconcile` 四类状态 + checksum 移动检测 + **无静默删** + 确定性 + path-safe `observe_dir`);rebuild-from-events 见 `replay`(MD-1b) |
-| **MD-3** ✅ | **AssertionStore 双时相 + Retriever(FTS)**:断言表两区间 + 证据链 + `qualified` 门;FTS 检索 + scope 隔离 | MD-2 | 写-查-失效-`as_of(valid,recorded)` 回看;矛盾=新版本非删;候选不进默认召回;scope 泄漏 0 | ✅ **3a AssertionStore**(双时相四象限 + supersede 非删 + qualified 门 + 跨 scope 零泄漏,migration 0004)· ✅ **3b Retriever**(FTS5 投影 migration 0005:MATCH 检索 + owner 隔离 + 仅当前/qualified + bm25 排序 + 确定性 rebuild + 查询消毒) |
+| **MD-1** 🟢 | **评测/恢复 spike**:两个 `Condenser`(确定性 recent-window + 保留尾部 summary,发 `Condensation` view-delta,**不删原始**);建可回放语料 + benchmark 装载 | D1 | 崩溃/重启/幂等重放;语料测 token 预算/关键事实保留/因果/投毒排除/跨 scope 泄漏;LongMemEval 装载跑通 | ✅ 已交付(MD-1a #113 + MD-1b #116 + MD-1c):session 测试全绿 + 上述全过 + **签名已冻结(§2.1)** |
+| **MD-2** 🟡 | **EventStore + ArtifactStore**(权威层):事件表 + markdown-CAS + 双谱系对账(checksum 移动检测) | MD-1 | 事件 append/scan/checkpoint 幂等;CAS 拒陈旧写;外部改文件→对账不静默删;rebuild 从事件重建投影 | ✅ 2a EventStore(#114)· ✅ 2b ArtifactStore(#115)· ✅ 2c 对账(`reconcile` 四类状态 + checksum 移动检测 + **无静默删** + 确定性 + path-safe `observe_dir`);rebuild-from-events 见 `replay`(MD-1b) |
+| **MD-3** 🟢 | **AssertionStore 双时相 + Retriever(FTS)**:断言表两区间 + 证据链 + `qualified` 门;FTS 检索 + scope 隔离 | MD-2 | 写-查-失效-`as_of(valid,recorded)` 回看;矛盾=新版本非删;候选不进默认召回;scope 泄漏 0 | ✅ **3a AssertionStore**(双时相四象限 + supersede 非删 + qualified 门 + 跨 scope 零泄漏,migration 0004)· ✅ **3b Retriever**(FTS5 投影 migration 0005:MATCH 检索 + owner 隔离 + 仅当前/qualified + bm25 排序 + 确定性 rebuild + 查询消毒) |
 | **MD-4** 🟢 | **MemoryWriter 写门(治理)**:candidate→闭 schema 校验→确定性策略→approve/commit;强制 owner;origin/trust;审计 | MD-3 | 恶意 ToolOutput/WebFetch 默认不落持久;UserSaid+显式 remember 才自动 commit;dry-run/review;bulk rollback | ✅ 核心:确定性策略(WebFetch/Unknown→Reject 不落持久;UserSaid+remember/System→Commit qualified;UserSaid/Model/ToolOutput→Hold 候选不进召回)+ 强制 owner + `mem.write_decision` 审计可回放 + dry-run 无副作用 + 投毒语料测试。🔜 **bulk rollback + turn→candidate 抽取**挂 MD-4b(文档标注为边界) |
 | **MD-5** 🟢 | **Consolidator 巩固循环**:后台读未巩固事件→写 insight→更新 persona;importance/consolidated 标记 | MD-3 | 巩固幂等;importance 排序;增量==全量重跑 | ✅ `Consolidator::run_once`/`insights` + `InsightSynth`(默认确定性 `CountSynth`)+ migration 0006:巩固幂等 + importance 排序 + **增量==全量重跑** + 跨 scope 零泄漏(每个巩固=其 key 所有事件的纯函数)。🔜 LLM 版 synth + LongMemEval 对照增益、checkpoint 增量优化留后续 |
 | **MD-6** 🟢 | **Retriever 本地向量(可选)**:`OmlxEmbedder` + SQLite 向量 + 双索引迁移 + FTS 兜底;`Embedding{model_id,revision,dims}` | MD-3, D4b | 换模型触发 reindex 状态机;可续重嵌;混版本行为 | ✅ 机制:`Embedder` 缝 + `VectorRetriever`(cosine 暴力,current-model-only,current+qualified+owner 门)+ migration 0007:换模型→FTS 兜底→reindex 状态机 + 可续重嵌(只嵌缺失)+ 混版本共存(reindex 不丢旧版本行)+ 跨 scope 隔离。🔜 **OmlxEmbedder 待 D4b**;「语义召回优于纯 FTS」对照需真模型,同挂 D4b(文档标注) |
-| **MD-7** ✅ | **知识/指令层(L4)**:层级 markdown(CLAUDE.md 式)合并 + 触发注入 + **审核门控 auto-memory inbox**(gemini-cli) | MD-2 | 层级合并优先级;触发命中;auto-memory 从不自动应用 | ✅ `KnowledgeBase`(`add_active`/`propose`/`merged`/`triggered`/`inbox`/`approve`/`reject`)+ migration 0008:priority 升序合并(高优先级后置=胜)+ 大小写不敏感触发注入 + **pending 提案永不进 merged/triggered(需人批)** + approve/reject owner-scoped + 跨 scope 零泄漏 |
-| **MD-8** ✅ | **长任务符号轨迹(H1/H2)**:全量工具日志落 `refs/*.md`,留符号图 + `node_id` 下钻(TencentDB) | MD-2 | 符号图可下钻回原文;压缩可恢复(非截断) | ✅ `TaskTrace`(`record`/`symbols`/`drill`/`expand_run`/`stats`)+ migration 0009:全量 body 存内容寻址 ref、prompt 只留 symbol;**drill 逐字返回原文(非截断)**、`expand_run` 证明 **100% 可恢复**、压缩率 >99% 有测试;相同 body 去重但各占一个 node;drill owner-scoped;空 run stats 不除零 |
+| **MD-7** 🟢 | **知识/指令层(L4)**:层级 markdown(CLAUDE.md 式)合并 + 触发注入 + **审核门控 auto-memory inbox**(gemini-cli) | MD-2 | 层级合并优先级;触发命中;auto-memory 从不自动应用 | ✅ `KnowledgeBase`(`add_active`/`propose`/`merged`/`triggered`/`inbox`/`approve`/`reject`)+ migration 0008:priority 升序合并(高优先级后置=胜)+ 大小写不敏感触发注入 + **pending 提案永不进 merged/triggered(需人批)** + approve/reject owner-scoped + 跨 scope 零泄漏 |
+| **MD-8** 🟢 | **长任务符号轨迹(H1/H2)**:全量工具日志落 `refs/*.md`,留符号图 + `node_id` 下钻(TencentDB) | MD-2 | 符号图可下钻回原文;压缩可恢复(非截断) | ✅ `TaskTrace`(`record`/`symbols`/`drill`/`expand_run`/`stats`)+ migration 0009:全量 body 存内容寻址 ref、prompt 只留 symbol;**drill 逐字返回原文(非截断)**、`expand_run` 证明 **100% 可恢复**、压缩率 >99% 有测试;相同 body 去重但各占一个 node;drill owner-scoped;空 run stats 不除零 |
 | **MD-X** | **crate 拆分**:`agent24-memory` → `memory-{core,episodic,semantic,knowledge}` + facade——**仅当依赖/发布边界被证明**(Codex 收口:先模块后 crate) | MD-2..7 | 编译/依赖图无环 | 有真实边界才拆,否则不拆 |
 
 ---
