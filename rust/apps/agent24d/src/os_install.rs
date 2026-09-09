@@ -105,20 +105,24 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // that borrowed guarantee disappears with no symptom except packages missing a
     // few files. Cheaper not to share the path in the first place.
     let staging = staging_path(packages_root, manifest.name());
-    // Sweep debris from a PREVIOUS process before staging a new one.
+    // Sweep THIS PROCESS's own earlier staging directories.
     //
-    // Adding the counter made the old `if staging.exists()` line dead — the path is
-    // unique per call, so it never exists. But the debris it used to remove is
-    // still produced: a daemon killed mid-copy leaves `.staging-*` behind forever.
-    // That is not merely untidy. Until the scanner learned to refuse dot-prefixed
-    // directories, such wreckage was DISCOVERED as a package — with a valid
-    // manifest, since the manifest is copied first — and `.` sorting before every
-    // letter meant it beat the real package to the name.
+    // Scope, stated exactly, because an earlier version of this comment claimed
+    // more than the code does: it removes debris left by EARLIER INSTALLS IN THIS
+    // SAME PROCESS. It does NOT clean up after a daemon that was killed — that
+    // daemon's pid is by definition not this one's, and its leftovers stay. That is
+    // acceptable now only because the scanner refuses dot-prefixed directories, so
+    // such wreckage is inert and shows up by name in the refusal list rather than
+    // masquerading as a package.
     //
-    // Only this process's own leftovers are removed. Another daemon may be staging
-    // right now, and deleting a live staging directory is exactly the accidental
-    // "safety through the other party failing" that the counter was added to stop
-    // relying on.
+    // Why not sweep every stale directory: another daemon may be staging right now,
+    // and deleting a live staging tree is the accidental "safety through the other
+    // party failing entirely" that the per-call counter was added to stop relying
+    // on. Reaching into another process's work to tidy up would reintroduce it.
+    //
+    // (Adding the counter also made the old `if staging.exists()` line dead — the
+    // path is unique per call, so it never existed. The debris it used to remove is
+    // still produced; this is what removes it now.)
     sweep_own_stale_staging(packages_root);
     copy_tree(src, &staging).inspect_err(|_| remove_quietly(&staging))?;
 
@@ -184,18 +188,42 @@ fn staging_path(packages_root: &Path, name: &str) -> PathBuf {
 /// different pid's debris is left for the operator, who sees it named in the
 /// scanner's refusal list.
 fn sweep_own_stale_staging(packages_root: &Path) {
-    let prefix = ".staging-";
-    let me = format!("-{}-", std::process::id());
+    let me = std::process::id();
     let Ok(entries) = std::fs::read_dir(packages_root) else {
         return;
     };
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(prefix) && name.contains(&me) {
+        if staged_by(name) == Some(me) {
             remove_quietly(&e.path());
         }
     }
+}
+
+/// The pid field of a staging directory name, or `None` if it is not one.
+///
+/// Parsed as FIELDS, not searched as a substring. A module name may contain `-`
+/// and digits (`[a-z0-9][a-z0-9_-]*`), so `-<mypid>-` appearing ANYWHERE in the
+/// name does not mean the pid field is mine: a package legitimately called
+/// `cos-12132`, staged by process 999999, produces `.staging-cos-12132-999999-0`
+/// — which a substring test run by pid 12132 claims as its own and deletes. That
+/// is another process's live staging tree, which is exactly the thing the pid
+/// scoping exists to protect.
+///
+/// The layout is `.staging-{name}-{pid}-{seq}` and only the last two fields have
+/// fixed positions, so it is split from the RIGHT.
+fn staged_by(dir_name: &str) -> Option<u32> {
+    let rest = dir_name.strip_prefix(".staging-")?;
+    let mut from_right = rest.rsplitn(3, '-');
+    let _seq = from_right.next()?;
+    let pid = from_right.next()?;
+    // A name must remain: `.staging--123-0` is not a staging directory of ours.
+    let name = from_right.next()?;
+    if name.is_empty() {
+        return None;
+    }
+    pid.parse().ok()
 }
 
 /// Best-effort cleanup. A failure here is not reported: the caller is already
@@ -533,13 +561,31 @@ mod tests {
         let theirs = pkgs.join(".staging-cos72-999999-0");
         std::fs::create_dir_all(&theirs).unwrap();
 
+        // The same, but with a package name that CONTAINS our pid. A module name
+        // may hold `-` and digits, so `cos-<mypid>` is legal — and a substring test
+        // for `-<mypid>-` claims this directory as ours even though its pid field
+        // says 999999. It belongs to a process that may be writing to it right now.
+        let decoy = pkgs.join(format!(".staging-cos-{}-999999-0", std::process::id()));
+        std::fs::create_dir_all(&decoy).unwrap();
+
         let src = src_pkg(t.path(), "src", "cos72");
         install(&src, &pkgs).unwrap();
 
-        assert!(!mine.exists(), "our own stale staging must be swept");
+        // BOTH directions, deliberately adjacent. The negative alone ("we did not
+        // delete someone else's") is satisfied by a sweep that deletes NOTHING, so
+        // it can only be read next to the positive.
+        assert!(
+            !mine.exists(),
+            "our own stale staging must be swept (positive)"
+        );
         assert!(
             theirs.exists(),
-            "another process's staging must be left alone — it may be live"
+            "another process's staging must be left alone — it may be live (negative)"
+        );
+        assert!(
+            decoy.exists(),
+            "a package name containing our pid must not make another process's \
+             staging look like ours — the pid is a FIELD, not a substring"
         );
         assert!(pkgs.join("cos72").join(MANIFEST_FILE).is_file());
     }
