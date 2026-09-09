@@ -527,6 +527,18 @@ mod tests {
         // lets the small install finish before the big one has even created its
         // staging directory — and then the test proves nothing. (Measured: with a
         // plain race, restoring the buggy sweep did not fail this test at all.)
+        // Wait until the other install is WELL INTO its copy, not merely started.
+        //
+        // `(1..FILES)` looked like "mid-copy" but releases on the very first file,
+        // so the sweep would delete only the handful copied so far — measured, the
+        // victim finished 3996 of 4000 and the test's margin was FOUR FILES. A
+        // victim that raced ahead and renamed first would have made it 4000 == 4000
+        // and gone quietly green. `(FILES/4 .. FILES*3/4)` puts the deletion in the
+        // middle: measured ~2560 of 4000, a margin of ~1435.
+        //
+        // Both directions have to be checked when tuning this: widening the wait
+        // until "the big install never finishes" would also turn the red side red.
+        //
         // Wait for the other install to be MID-COPY, not merely started. "Its
         // staging directory exists" is not enough: it may already have finished
         // copying, and then nothing can be lost. (Measured: with only that weaker
@@ -552,7 +564,7 @@ mod tests {
                         .map(std::iter::Iterator::count)
                         .unwrap_or(0)
                 })
-                .is_some_and(|n| (1..FILES).contains(&n));
+                .is_some_and(|n| (FILES / 4..FILES * 3 / 4).contains(&n));
             if partial {
                 break;
             }
