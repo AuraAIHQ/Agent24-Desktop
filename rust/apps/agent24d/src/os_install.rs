@@ -105,25 +105,25 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // that borrowed guarantee disappears with no symptom except packages missing a
     // few files. Cheaper not to share the path in the first place.
     let staging = staging_path(packages_root, manifest.name());
-    // Sweep THIS PROCESS's own earlier staging directories.
+    // There is deliberately NO sweep of stale staging directories here. An earlier
+    // version had one, scoped to this pid, and it was removed because its set of
+    // correct behaviours is EMPTY while its set of incorrect ones is catastrophic:
     //
-    // Scope, stated exactly, because an earlier version of this comment claimed
-    // more than the code does: it removes debris left by EARLIER INSTALLS IN THIS
-    // SAME PROCESS. It does NOT clean up after a daemon that was killed — that
-    // daemon's pid is by definition not this one's, and its leftovers stay. That is
-    // acceptable now only because the scanner refuses dot-prefixed directories, so
-    // such wreckage is inert and shows up by name in the refusal list rather than
-    // masquerading as a package.
+    //   - Same process, failed install: every failure path below already removes
+    //     its own staging. Nothing to sweep.
+    //   - Same process, crashed: the process is gone, so the next daemon has a
+    //     different pid and cannot recognise the debris as its own anyway.
+    //   - Same process, a CONCURRENT install still running: same pid, different
+    //     seq — indistinguishable by name from the dead debris above. The sweep
+    //     deletes a live sibling's half-written tree. Measured: the victim then
+    //     completes and `rename`s a package that is missing a hundred files, and
+    //     `install` returns Ok. A half package, installed atomically, with no error
+    //     signal anywhere.
     //
-    // Why not sweep every stale directory: another daemon may be staging right now,
-    // and deleting a live staging tree is the accidental "safety through the other
-    // party failing entirely" that the per-call counter was added to stop relying
-    // on. Reaching into another process's work to tidy up would reintroduce it.
-    //
-    // (Adding the counter also made the old `if staging.exists()` line dead — the
-    // path is unique per call, so it never existed. The debris it used to remove is
-    // still produced; this is what removes it now.)
-    sweep_own_stale_staging(packages_root);
+    // The identification could not be fixed by tightening it, because the two cases
+    // it must separate carry identical names. Crash debris is instead left for the
+    // operator: it is inert (the scanner refuses dot-prefixed directories) and it is
+    // visible by name in the scan's refusal list.
     copy_tree(src, &staging).inspect_err(|_| remove_quietly(&staging))?;
 
     // NOTE, so nobody mistakes where the guarantee comes from: today's atomicity
@@ -178,52 +178,6 @@ fn staging_path(packages_root: &Path, name: &str) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     packages_root.join(format!(".staging-{name}-{}-{seq}", std::process::id()))
-}
-
-/// Remove staging directories left by an EARLIER RUN OF THIS PROCESS ID.
-///
-/// Scoped to this pid on purpose: another daemon may be staging concurrently, and
-/// removing a live staging tree is precisely the "one party wins because the other
-/// fails entirely" behaviour the per-call counter exists to stop depending on. A
-/// different pid's debris is left for the operator, who sees it named in the
-/// scanner's refusal list.
-fn sweep_own_stale_staging(packages_root: &Path) {
-    let me = std::process::id();
-    let Ok(entries) = std::fs::read_dir(packages_root) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if staged_by(name) == Some(me) {
-            remove_quietly(&e.path());
-        }
-    }
-}
-
-/// The pid field of a staging directory name, or `None` if it is not one.
-///
-/// Parsed as FIELDS, not searched as a substring. A module name may contain `-`
-/// and digits (`[a-z0-9][a-z0-9_-]*`), so `-<mypid>-` appearing ANYWHERE in the
-/// name does not mean the pid field is mine: a package legitimately called
-/// `cos-12132`, staged by process 999999, produces `.staging-cos-12132-999999-0`
-/// — which a substring test run by pid 12132 claims as its own and deletes. That
-/// is another process's live staging tree, which is exactly the thing the pid
-/// scoping exists to protect.
-///
-/// The layout is `.staging-{name}-{pid}-{seq}` and only the last two fields have
-/// fixed positions, so it is split from the RIGHT.
-fn staged_by(dir_name: &str) -> Option<u32> {
-    let rest = dir_name.strip_prefix(".staging-")?;
-    let mut from_right = rest.rsplitn(3, '-');
-    let _seq = from_right.next()?;
-    let pid = from_right.next()?;
-    // A name must remain: `.staging--123-0` is not a staging directory of ours.
-    let name = from_right.next()?;
-    if name.is_empty() {
-        return None;
-    }
-    pid.parse().ok()
 }
 
 /// Best-effort cleanup. A failure here is not reported: the caller is already
@@ -543,51 +497,90 @@ mod tests {
     }
 
     #[test]
-    fn a_new_install_sweeps_this_processs_own_stale_staging() {
-        // Debris outlives the process that made it. Adding the per-call counter
-        // made the old `if staging.exists()` check dead — the path is unique now —
-        // so nothing was cleaning up after a crash any more.
+    fn a_concurrent_install_is_not_disturbed_by_another_one() {
+        // This replaces a test for a sweep that was removed. The sweep could not
+        // tell this process's DEAD debris from this process's LIVE sibling — both
+        // carry the same pid, only the seq differs — so it deleted a running
+        // install's half-written tree. The victim then finished and renamed a
+        // package missing a hundred files, and `install` returned Ok: a half
+        // package, installed atomically, with no error signal anywhere.
+        //
+        // The property now is simply that two installs running at once do not
+        // interfere. The source is large enough that the two overlap in practice
+        // rather than finishing one after the other.
         let t = tempfile::tempdir().unwrap();
         let pkgs = t.path().join("packages");
         std::fs::create_dir_all(&pkgs).unwrap();
 
-        let mine = pkgs.join(format!(".staging-cos72-{}-0", std::process::id()));
-        std::fs::create_dir_all(&mine).unwrap();
-        std::fs::write(mine.join("junk"), b"half a package").unwrap();
+        let big = src_pkg(t.path(), "big", "beta");
+        std::fs::create_dir_all(big.join("many")).unwrap();
+        const FILES: usize = 4000;
+        for i in 0..FILES {
+            std::fs::write(big.join("many").join(format!("f{i}")), b"x").unwrap();
+        }
+        let small = src_pkg(t.path(), "small", "alpha");
 
-        // Another daemon's debris. NOT ours to delete: it may be staging right now,
-        // and removing a live staging tree is exactly the "the other party fails
-        // entirely" behaviour the counter was added to stop depending on.
-        let theirs = pkgs.join(".staging-cos72-999999-0");
-        std::fs::create_dir_all(&theirs).unwrap();
+        let (p1, p2) = (pkgs.clone(), pkgs.clone());
+        let h = std::thread::spawn(move || install(&big, &p1));
 
-        // The same, but with a package name that CONTAINS our pid. A module name
-        // may hold `-` and digits, so `cos-<mypid>` is legal — and a substring test
-        // for `-<mypid>-` claims this directory as ours even though its pid field
-        // says 999999. It belongs to a process that may be writing to it right now.
-        let decoy = pkgs.join(format!(".staging-cos-{}-999999-0", std::process::id()));
-        std::fs::create_dir_all(&decoy).unwrap();
+        // Overlap DETERMINISTICALLY, not by hoping. A sleep, or just starting both,
+        // lets the small install finish before the big one has even created its
+        // staging directory — and then the test proves nothing. (Measured: with a
+        // plain race, restoring the buggy sweep did not fail this test at all.)
+        // Wait for the other install to be MID-COPY, not merely started. "Its
+        // staging directory exists" is not enough: it may already have finished
+        // copying, and then nothing can be lost. (Measured: with only that weaker
+        // condition, restoring the buggy sweep failed this test 2 runs in 3 — a
+        // detector that works two thirds of the time is not a regression test.)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the other install never reached a partially-copied state"
+            );
+            let partial = std::fs::read_dir(&p2)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .find(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".staging-beta-")
+                })
+                .map(|e| {
+                    std::fs::read_dir(e.path().join("many"))
+                        .map(std::iter::Iterator::count)
+                        .unwrap_or(0)
+                })
+                .is_some_and(|n| (1..FILES).contains(&n));
+            if partial {
+                break;
+            }
+            std::thread::yield_now();
+        }
 
-        let src = src_pkg(t.path(), "src", "cos72");
-        install(&src, &pkgs).unwrap();
+        let r2 = install(&small, &p2);
+        let r1 = h.join().unwrap();
+        assert!(r1.is_ok() && r2.is_ok(), "{r1:?} {r2:?}");
 
-        // BOTH directions, deliberately adjacent. The negative alone ("we did not
-        // delete someone else's") is satisfied by a sweep that deletes NOTHING, so
-        // it can only be read next to the positive.
-        assert!(
-            !mine.exists(),
-            "our own stale staging must be swept (positive)"
+        // The whole point: COUNT the files. "It returned Ok" was true in the broken
+        // version too — that is exactly what made the bug invisible.
+        let installed = std::fs::read_dir(pkgs.join("beta").join("many"))
+            .unwrap()
+            .count();
+        assert_eq!(
+            installed, FILES,
+            "a concurrent install must not lose files from another one"
         );
+        assert!(pkgs.join("alpha").join(MANIFEST_FILE).is_file());
+        // Control: no debris either, so "complete" is not being satisfied by a
+        // package that was never staged concurrently at all.
         assert!(
-            theirs.exists(),
-            "another process's staging must be left alone — it may be live (negative)"
+            !snapshot(&pkgs)
+                .iter()
+                .any(|e| e.rel.starts_with(".staging")),
+            "no staging debris"
         );
-        assert!(
-            decoy.exists(),
-            "a package name containing our pid must not make another process's \
-             staging look like ours — the pid is a FIELD, not a substring"
-        );
-        assert!(pkgs.join("cos72").join(MANIFEST_FILE).is_file());
     }
 
     #[test]
