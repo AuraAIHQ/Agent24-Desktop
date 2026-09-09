@@ -727,6 +727,52 @@ pub async fn serve(
                 .map_err(|e| e.to_string())
         }),
     }];
+
+    // ---- ME-3a: the catalogue is no longer only what was compiled in ----------
+    //
+    // Everything above is a build-time entry. Everything below was found on disk
+    // AFTER this binary was built, which is the only shape that can demonstrate
+    // "installing a third-party domain OS needs no kernel change" — a mock entry
+    // appended to the `vec!` above would prove nothing, because reaching that
+    // `vec!` means editing and rebuilding the daemon.
+    //
+    // A discovered package is NOT constructed here, and cannot be: an
+    // out-of-process module has no Rust type, and the transport that would give it
+    // one is ME-3b. Its `build` closure therefore returns an error naming that.
+    // The module still reaches the mounter, is refused there by the check that
+    // already exists, and — this is the point — appears in `agent24 os list` with
+    // a reason. Discovery and transport are now separate problems.
+    let packages_root = os_packages_root(&state_dir, ephemeral);
+    let mut catalogue = catalogue;
+    let scan = crate::os_discovery::scan(&packages_root);
+    for r in &scan.refused {
+        tracing::warn!(
+            "domain OS package at {} was not loaded: {}",
+            r.dir.display(),
+            r.why
+        );
+    }
+    for d in scan.found {
+        let name = d.manifest.name().to_owned();
+        let version = d.manifest.version().to_owned();
+        let dir = d.dir.clone();
+        tracing::info!(
+            "discovered domain OS {name:?} v{version} at {}",
+            dir.display()
+        );
+        catalogue.push(crate::domain::Installed {
+            name,
+            version,
+            build: Box::new(move || {
+                Err(format!(
+                    "{} declares an out-of-process provider; that transport is not \
+                     implemented yet (ME-3b)",
+                    dir.display()
+                ))
+            }),
+        });
+    }
+
     let os_config_path =
         crate::os_config::config_path().ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let os_config = crate::os_config::OsConfig::load(&os_config_path);
@@ -956,6 +1002,33 @@ pub async fn serve(
         agent24_protocol::state_file::remove_if_owner(daemon_pid);
     }
     result
+}
+
+/// Where installed domain-OS PACKAGES live — deliberately NOT the same root as
+/// their data.
+///
+/// Data lives in `~/.agent24/os/<name>/`, which the module owns and writes to.
+/// A package holds the manifest, and the manifest is what DECIDES the module's
+/// name, namespace and data directory. Putting the two in one tree would let a
+/// module rewrite its own identity at runtime by writing one file into the
+/// directory it was handed — so the manifest must live somewhere the module is
+/// not given a handle to.
+///
+/// `A24_OS_PACKAGES` overrides it. That is not a convenience: it is what lets a
+/// test install a package into a temp dir and prove the catalogue is read at
+/// startup rather than compiled in, WITHOUT rebuilding the binary.
+fn os_packages_root(state_dir: &std::path::Path, ephemeral: bool) -> std::path::PathBuf {
+    if let Some(over) = std::env::var_os("A24_OS_PACKAGES") {
+        return std::path::PathBuf::from(over);
+    }
+    if ephemeral {
+        // An ephemeral daemon must not read the real user's packages: it is used
+        // by tests and by `agent24 chat` with no daemon running, and silently
+        // mounting whatever the user happens to have installed would make those
+        // runs depend on machine state they never asked about.
+        return std::env::temp_dir().join(format!("agent24-ephemeral-pkgs-{}", std::process::id()));
+    }
+    state_dir.join("packages")
 }
 
 #[cfg(test)]
