@@ -26,11 +26,12 @@
 > | `.consolidator(` / `Consolidator` | 0 / 0 | MD-5 |
 > | `.knowledge(` / `KnowledgeBase` | 0 / 0 | MD-7 |
 > | `.trace(` / `TaskTrace` | 0 / 0 | MD-8 |
+> | `.write_gate(` / `MemoryWriter` | 0 / 0 | MD-4 |
 >
 > **`.events(` 的 10 处就是正对照** —— 它证明这把量具看得见「已接线」长什么样,所以其余的 0 是真的 0,不是量具没工作。复跑:
 >
 > ```bash
-> for a in events artifacts assertions retriever knowledge trace consolidator; do
+> for a in events artifacts assertions retriever knowledge trace consolidator write_gate; do
 >   printf "%-14s " ".$a("; rg -c "\.$a\(" rust/apps | awk -F: '{s+=$2} END {print (s?s:0)}'
 > done
 > ```

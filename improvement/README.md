@@ -102,4 +102,4 @@ codex(trait 形状/路径安全)· goose(TokenEstimator/hide-not-delete)· OpenH
 
 ## 6. 开工条件
 
-用户 2026-08-22 指令:**「等 milestone 都搞一阶段之后再开始」**。当前 M-D 主线 MD-1..8 已交付;M-E 尚未开始。开工前请用户确认批次与优先级。
+用户 2026-08-22 指令:**「等 milestone 都搞一阶段之后再开始」**。当前 M-D 的 MD-1..8 **库原语已交付,但 daemon 尚未端到端消费**(逐行状态与判据见 `docs/specs/SPEC-MD-ME.md` §0 上方那张表 —— 今天没有任何一行是 ✅);M-E 的 ME-1/ME-2 已交付,ME-3 设计已定稿。开工前请用户确认批次与优先级。
