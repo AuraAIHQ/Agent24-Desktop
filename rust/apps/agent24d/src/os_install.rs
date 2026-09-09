@@ -95,16 +95,33 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // Staging lives INSIDE the packages root, not in the system temp directory.
     // That is the whole point: `/tmp` is frequently a different volume (it is on
     // stock macOS), and a cross-device rename is not atomic.
-    let staging = packages_root.join(format!(
-        ".staging-{}-{}",
-        manifest.name(),
-        std::process::id()
-    ));
+    // The name carries a per-call counter as well as the pid. Without it, two
+    // concurrent installs of the SAME package in one process share a staging path,
+    // and the cleanup below has the second caller delete the first caller's
+    // half-written tree. Measured, that still ends cleanly — one wins, one fails,
+    // nothing partial is installed — but it ends cleanly for the WRONG REASON:
+    // safety comes from the interrupted caller failing ENTIRELY, not from the two
+    // never touching each other. The day this function grows a resumable path,
+    // that borrowed guarantee disappears with no symptom except packages missing a
+    // few files. Cheaper not to share the path in the first place.
+    let staging = staging_path(packages_root, manifest.name());
+    // Unreachable in practice — the counter is monotonic within the process and the
+    // pid separates processes — but a crashed predecessor can leave an OLDER
+    // staging directory behind. Those are not this call's to delete: removing a
+    // path it did not create is how the shared-path race got its accidental
+    // safety, and this function should not rely on that a second time.
     if staging.exists() {
         remove_quietly(&staging);
     }
     copy_tree(src, &staging).inspect_err(|_| remove_quietly(&staging))?;
 
+    // NOTE, so nobody mistakes where the guarantee comes from: today's atomicity
+    // comes from staging being CONSTRUCTED inside the destination's parent, not
+    // from this check — the check cannot fire as long as that construction holds,
+    // and the tests exercise the function, not the gate. Its value is entirely in
+    // the future: the first time someone moves staging elsewhere, this is what
+    // turns a silent loss of atomicity into a refused install.
+    //
     // Belt and braces: staging is inside the destination's parent by construction,
     // so this should always hold. It is checked anyway because the cost of being
     // wrong is silent partial state on somebody else's machine, and because a
@@ -137,6 +154,19 @@ pub fn uninstall(name: &str, packages_root: &Path) -> Result<bool, InstallError>
         InstallError::Filesystem(format!("could not remove {}: {e}", dest.display()))
     })?;
     Ok(true)
+}
+
+/// A staging path that NO other call will ever produce.
+///
+/// Extracted so the property can be observed. It is not testable through
+/// `install`: sequential calls each clean up after themselves, so a test written
+/// against `install` passes whether or not the paths collide — which is exactly
+/// what a mutation showed when this was first written as an assertion about
+/// leftover debris.
+fn staging_path(packages_root: &Path, name: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    packages_root.join(format!(".staging-{name}-{}-{seq}", std::process::id()))
 }
 
 /// Best-effort cleanup. A failure here is not reported: the caller is already
@@ -432,6 +462,27 @@ mod tests {
             "the packages root must be byte-for-byte unchanged"
         );
         assert!(existing.join(MANIFEST_FILE).is_file());
+    }
+
+    #[test]
+    fn two_calls_never_produce_the_same_staging_path() {
+        // Two concurrent installs of the SAME package must not share a staging
+        // directory. Measured externally, sharing one still ends cleanly — but for
+        // the wrong reason: the loser's tree is DELETED by the winner and the loser
+        // then fails entirely. That guarantee is borrowed, and it disappears the
+        // day this function can resume or retry.
+        //
+        // This asserts the path directly. An earlier version of this test asserted
+        // "repeated installs leave no debris" instead, and a mutation that removed
+        // the counter killed nothing — sequential calls clean up after themselves
+        // either way, so the test held with and without the property.
+        let root = Path::new("/tmp/whatever");
+        let a = staging_path(root, "cos72");
+        let b = staging_path(root, "cos72");
+        assert_ne!(a, b, "the same package must not reuse a staging path");
+        // And it must still be inside the packages root, or atomicity is gone.
+        assert_eq!(a.parent(), Some(root));
+        assert_eq!(b.parent(), Some(root));
     }
 
     #[test]
