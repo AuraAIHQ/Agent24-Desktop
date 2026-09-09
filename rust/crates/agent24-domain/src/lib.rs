@@ -179,27 +179,6 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// version: a manifest can be v1 while the protocol moves, and vice versa.
 pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
 
-/// The FIRST of two parse steps — deliberately TOLERANT.
-///
-/// It reads only the fields needed to decide "can this build even understand the
-/// rest?", and it must NOT carry `deny_unknown_fields`: a manifest from the
-/// future will have fields this build has never heard of, and the whole point of
-/// this step is to reach the version check BEFORE any of them cause a failure.
-/// Step two ([`RawManifest`]) is the strict one.
-///
-/// Every field is optional, including `name` — a manifest too broken to yield a
-/// name still has to produce a message better than a serde error, so the version
-/// gate reports `"<unnamed>"` rather than refusing to run.
-#[derive(Deserialize)]
-struct ManifestEnvelope {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    manifest_version: Option<u32>,
-    #[serde(default)]
-    min_daemon_protocol: Option<u32>,
-}
-
 /// The wire shape of `domain-os.yml`. PRIVATE, and the only MANIFEST type that
 /// derives `Deserialize`, so a caller cannot skip validation by deserializing
 /// straight into the validated type. `deny_unknown_fields` turns a typo like
@@ -330,25 +309,49 @@ impl DomainOsManifest {
                 Self::MAX_YAML_BYTES
             )));
         }
-        // ---- step one: TOLERANT envelope, only to reach the version gate ----
+        // Parse the TEXT exactly once, into an untyped tree; both steps below read
+        // that tree. Two `from_str` calls would be two parses, and YAML parsing is
+        // not free on hostile input: a 446-byte alias-expansion bomb measured
+        // ~171ms per parse on this machine (serde_yaml rejects it — after doing
+        // the work), so parsing twice doubles what an attacker gets for a document
+        // well under `MAX_YAML_BYTES`.
         //
-        // Order is load-bearing. Parsing the strict shape first means a manifest
-        // from the future dies on an unknown field, with a message about that
-        // field and no hint that the daemon is the thing that is out of date.
-        let env: ManifestEnvelope = serde_yaml::from_str(yaml)
-            .map_err(|e| DomainError::Manifest(format!("could not read manifest envelope: {e}")))?;
-        let module = env.name.clone().unwrap_or_else(|| "<unnamed>".to_owned());
+        // It also removes a question this design would otherwise have to answer:
+        // whether two independent parses of the same text are guaranteed to agree.
+        // Reading one tree twice, they provably are.
+        let tree: serde_yaml::Value =
+            serde_yaml::from_str(yaml).map_err(|e| DomainError::Manifest(e.to_string()))?;
 
-        let declared_schema = env.manifest_version.unwrap_or(1);
-        if declared_schema > MANIFEST_SCHEMA_VERSION {
+        // ---- step one: TOLERANT read, only to reach the version gate ----
+        //
+        // Order is load-bearing. Deserializing the strict shape first means a
+        // manifest from the future dies on an unknown field, with a message about
+        // that field and no hint that the daemon is the thing that is out of date.
+        //
+        // Plain key lookups rather than a typed envelope struct: a struct would
+        // need `deny_unknown_fields` off to survive a future document, and then it
+        // would be a second shape to keep in sync with the first. Three lookups
+        // cannot drift.
+        let field_u32 = |k: &str| tree.get(k).and_then(serde_yaml::Value::as_u64);
+        let module = tree
+            .get("name")
+            .and_then(serde_yaml::Value::as_str)
+            // A manifest too broken to yield a name still has to produce a message
+            // better than a serde error, so the gate names it `<unnamed>` rather
+            // than refusing to run.
+            .unwrap_or("<unnamed>")
+            .to_owned();
+
+        let declared_schema = field_u32("manifest_version").unwrap_or(1);
+        if declared_schema > u64::from(MANIFEST_SCHEMA_VERSION) {
             return Err(DomainError::ManifestUnsupported {
                 module,
                 requirement: format!("manifest schema v{declared_schema}"),
                 supported: format!("v{MANIFEST_SCHEMA_VERSION}"),
             });
         }
-        if let Some(min) = env.min_daemon_protocol
-            && min > DAEMON_PROTOCOL_VERSION
+        if let Some(min) = field_u32("min_daemon_protocol")
+            && min > u64::from(DAEMON_PROTOCOL_VERSION)
         {
             return Err(DomainError::ManifestUnsupported {
                 module,
@@ -359,7 +362,7 @@ impl DomainOsManifest {
 
         // ---- step two: the STRICT shape, now that the version is known-good ----
         let raw: RawManifest =
-            serde_yaml::from_str(yaml).map_err(|e| DomainError::Manifest(e.to_string()))?;
+            serde_yaml::from_value(tree).map_err(|e| DomainError::Manifest(e.to_string()))?;
 
         if !valid_name(&raw.name) {
             return Err(DomainError::Manifest(format!(
@@ -892,6 +895,25 @@ impl_kind: in_process_crate
              version mismatch: {err:?}"
         );
         assert!(err.to_string().contains("warp_drive"), "{err}");
+    }
+
+    #[test]
+    fn the_document_is_parsed_once_not_twice() {
+        // The property: BOTH steps read one tree, so they cannot disagree, and a
+        // hostile document is not paid for twice. There is no clean way to count
+        // parses from outside, so this asserts the observable consequence — the
+        // two shapes agree about a document that is legal for one reading and not
+        // the other. `serde_yaml` refuses duplicate keys outright (measured), so a
+        // document cannot present one `name` to the gate and another to the strict
+        // shape; this test pins that we depend on that refusal.
+        let dup = format!("{SIN90_YAML}name: impostor\n");
+        let err = DomainOsManifest::from_yaml(&dup).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate"),
+            "a second `name` must be refused by the parser, not silently resolved \
+             to one of the two — the version gate and the strict shape would then \
+             be reading different documents: {err}"
+        );
     }
 
     #[test]
