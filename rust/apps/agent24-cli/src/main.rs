@@ -67,6 +67,14 @@ enum Command {
 enum OsAction {
     /// Show every domain OS the daemon knows about, and what it did with each
     List,
+    // EXPIRES WITH ME-3b. Both "applies at the next daemon start" lines below are
+    // true TODAY for one reason only: a toggle is written to the config and
+    // nothing acts on a running module, so a restart is the only path by which it
+    // takes effect. ME-3's two-phase hot disable (SPEC §4, delivered in ME-3b's
+    // last slice) makes disable act immediately — at which point these two lines
+    // become false with no test to notice, because no test can assert what a help
+    // string promises. The note lives here rather than in the follow-ups ledger so
+    // that it is read by whoever changes the thing that makes it false.
     /// Turn one on (applies at the next daemon start)
     Enable {
         /// Module name, e.g. sin90
@@ -333,12 +341,19 @@ fn os_local(action: &OsAction) -> Option<Result<(), String>> {
     // reimposed the `HOME` requirement that the override exists to lift, and
     // reported it with a message identical to the one for "neither is set" —
     // indistinguishable outputs for two situations, one of which was wrong.
-    let root =
-        match agent24_os_packages::resolve_packages_root(state_file::state_dir().as_deref(), false)
-        {
-            Ok(root) => root,
-            Err(e) => return Some(Err(format!("{e} (set HOME, or set A24_OS_PACKAGES)"))),
-        };
+    let root = match agent24_os_packages::resolve_packages_root(
+        agent24_os_packages::env_override().as_deref(),
+        state_file::state_dir().as_deref(),
+        false,
+    ) {
+        Ok(root) => root,
+        Err(e) => {
+            return Some(Err(format!(
+                "{e} (set HOME, or set {})",
+                agent24_os_packages::PACKAGES_ROOT_ENV
+            )));
+        }
+    };
     match action {
         OsAction::Install { path } => Some(
             agent24_os_packages::install::install(path, &root)
