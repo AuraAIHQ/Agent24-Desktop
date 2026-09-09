@@ -146,13 +146,51 @@ $A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
 
 canary 每 5 分钟一发、7 天两千次，打公共 relay 必然吃限流，于是 **`degraded` 会是 relay 的错而不是我们的错**，判据 6 被第三方可用性绑架。
 
-**结论：F5 用本地 minirelay。**
+### ⛔ 但**别用本地 minirelay** —— 它会把一个上游竞态从偶发变成必然（2026-09-09 实测推翻了本节的上一版结论）
+
+本节上一版写「结论：F5 用本地 minirelay」。**那是错的，收回。**
+
+实测：切到本地 relay 后，canary **发得出去、daemon 收得到**（`hyphae-daemon.log` 里每条都有 `📨 New message ... a24-liveness-canary`），但桥**一条都确认不了**，`sent=73 confirmed=0 lost=61`，`state` 永远 `degraded`。
+
+**原因是 FU-33 记的那个上游竞态，本地 relay 让它 100% 触发**：
+
+- `internal/messaging/agent.go:220` **先** `relay.Publish`，`:241` **才** `StoreOutgoingMessage`；
+- 而 store 用的是 `INSERT OR REPLACE`（`internal/storage/message.go:34`）；
+- 本地 relay 往返只要几毫秒，于是 **daemon 先把事件写成 `is_incoming=1`**，发送方的 CLI 随后 `INSERT OR REPLACE` **把它覆盖回 `is_incoming=0`**；
+- daemon 的 `seen` 集合让它**永不重处理**那个 event id；
+- 那行于是对 `history inbox` **永远不可见** → canary 永远确认不了。
+
+硬证据（`~/.hyphae/messages.db`）：
+
+```
+含 canary 的行：is_incoming=0 → 98 行 ｜ is_incoming=1 → 9 行
+```
+
+那 9 条是早期打公共 relay 时、往返够慢、侥幸赢了竞态的。
+
+**所以 relay 的选择不是「快 vs 慢」，是在两种失效之间选**：
+
+| 选项 | 失效 |
+|---|---|
+| 公共 relay（damus 等） | 限流 → `degraded` 是 relay 的错 |
+| 本地 minirelay | **竞态必发 → `confirmed` 永远是 0** |
+| `relay.aastar.io` | 当前下线 |
+| **修上游** | 无失效 —— 见下 |
+
+**唯一干净的解法是修上游**，而它是一行 SQL：`StoreOutgoingMessage` 的 upsert 让 `is_incoming` **单调**，即 `ON CONFLICT ... DO UPDATE SET is_incoming = messages.is_incoming OR excluded.is_incoming`（或者干脆先落库再发布）。FU-33 早就记了这条，今天它从「理论上可能」变成「实测挡住了 F5」。
+
+**在上游修好之前**：用公共 relay，并把 `A24_NOSTR_CANARY_MS` 放大到 15 分钟以上以避开限流（相应放大 `A24_NOSTR_STALE_MS`）。这会降低活性探针的时间分辨率——**如实记下来**，别当成没有代价。
 
 ```bash
-nohup ~/Dev/auraai/agent-speaker/bin/minirelay 7447 > ~/.agent24/minirelay.log 2>&1 &
-# 桥与 daemon 都指过去（必须同一个，不一致的症状与"通路真死了"一模一样）
-hyphae daemon --identity agent24 --notify=false --relay ws://localhost:7447
-A24_NOSTR_RELAY=ws://localhost:7447 pnpm --filter @agent24/nostr-bridge bridge
+# ⛔ 别这么做 —— 见下一节:本地 relay 会让上游竞态 100% 触发,confirmed 永远是 0
+# nohup ~/Dev/auraai/agent-speaker/bin/minirelay 7447 &
+# A24_NOSTR_RELAY=ws://localhost:7447 ...
+
+# 上游修好前的做法:公共 relay + 放大 canary 间隔避开限流
+R=wss://relay.damus.io
+hyphae daemon --identity agent24 --notify=false --relay "$R"
+A24_NOSTR_RELAY="$R" A24_NOSTR_CANARY_MS=900000 A24_NOSTR_STALE_MS=2700000 \
+  pnpm --filter @agent24/nostr-bridge bridge
 ```
 
 **代价要如实说**：本地 relay **测不到真实网络路径**（DNS、TLS、跨机 WS、睡眠后的连接僵尸）。它测的是「桥 ↔ hyphae daemon ↔ relay 这套机制本身活不活」。真实网络那一维要等 `relay.aastar.io` 恢复后单独补一轮——**别把本地 relay 跑绿了当成"Nostr 通路全程活着"**。
