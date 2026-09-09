@@ -391,8 +391,28 @@ impl DomainOsManifest {
         }
 
         // ---- step two: the STRICT shape, now that the version is known-good ----
-        let raw: RawManifest =
-            serde_yaml::from_value(tree).map_err(|e| DomainError::Manifest(e.to_string()))?;
+        let raw: RawManifest = serde_yaml::from_value(tree).map_err(|e| {
+            // `from_value` is the RIGHT deserializer here but it has one real
+            // cost: its errors carry no line/column, because the tree it walks has
+            // no positions. For a gate whose whole purpose is readable reasons,
+            // losing "at line 3 column 1" hurts.
+            //
+            // So on the ERROR PATH ONLY, re-read the text with `from_str` purely to
+            // borrow a better-located message. Two rules keep this safe:
+            //
+            //  - If `from_str` ACCEPTS what `from_value` rejected, discard it and
+            //    keep our error. The two disagree in ways where `from_str` is the
+            //    LOOSER one — it turns `name: ~` into the literal string "~", and
+            //    accepts `!!str 2` for a u32. Adopting its verdict would undo the
+            //    strictness this path was chosen for; we only ever borrow its prose.
+            //  - The cost is bounded: an expansion bomb never reaches here, because
+            //    it already failed at the `from_str::<Value>` above. Only documents
+            //    that parsed cleanly and then failed the SHAPE get the second read.
+            let located = serde_yaml::from_str::<RawManifest>(yaml.trim_start_matches('\u{feff}'))
+                .err()
+                .map(|located| located.to_string());
+            DomainError::Manifest(located.unwrap_or_else(|| e.to_string()))
+        })?;
 
         if !valid_name(&raw.name) {
             return Err(DomainError::Manifest(format!(
@@ -978,6 +998,53 @@ impl_kind: in_process_crate
                  downstream ({bad}): {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_yaml_null_is_not_accepted_as_the_literal_string_tilde() {
+        // Locks the reason `from_value` was chosen over `from_str` for the strict
+        // shape. Measured on serde_yaml 0.9.34:
+        //
+        //   from_str  : name: ~  →  Ok(name == "~")   ← a STRING whose content is "~"
+        //   from_value: name: ~  →  Err(invalid type: unit value, expected a string)
+        //
+        // The `from_str` outcome does not error, has the right type, and carries a
+        // wrong value — an error answer sitting inside the distribution of legal
+        // answers. If anyone ever switches this back to `from_str` (say, to regain
+        // line/column in errors), a module could be named "~". This test is what
+        // stops that from landing silently.
+        // Use `version`, NOT `name`. Under `from_str` a null `name` becomes the
+        // string "~" and is then caught by name validation — the same error
+        // VARIANT either way, so a test asserting the variant passes under both
+        // deserializers and proves nothing. (It was written that way; mutation 6
+        // — switching the strict parse back to `from_str` — killed nothing, which
+        // is how it was found.) `version` has no such second line of defence: "~"
+        // is non-empty, so it sails through and the manifest loads with a version
+        // of "~".
+        let yaml = SIN90_YAML.replace(r#"version: "0.2.1""#, "version: ~");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type"),
+            "a YAML null must be refused ON TYPE, never coerced to the string \
+             \"~\" and waved through: {err}"
+        );
+    }
+
+    #[test]
+    fn a_shape_error_keeps_its_line_and_column() {
+        // `from_value` errors carry no position — the tree it walks has none. The
+        // error path re-reads the text with `from_str` PURELY to borrow a located
+        // message. Without that, this gate would be strictly better at judging and
+        // strictly worse at explaining, which is a poor trade for something whose
+        // stated purpose is readable reasons.
+        let yaml = format!("{SIN90_YAML}warp_drive: true\n");
+        let msg = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(msg.contains("warp_drive"), "{msg}");
+        assert!(
+            msg.contains("line") && msg.contains("column"),
+            "the message must locate the offending field, or a long manifest is a \
+             scavenger hunt: {msg}"
+        );
     }
 
     #[test]
