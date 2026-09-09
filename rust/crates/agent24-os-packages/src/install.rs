@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::os_discovery::MANIFEST_FILE;
+use crate::discovery::MANIFEST_FILE;
 use agent24_domain::DomainOsManifest;
 
 /// Why an install did not happen. Every variant means the packages root was left

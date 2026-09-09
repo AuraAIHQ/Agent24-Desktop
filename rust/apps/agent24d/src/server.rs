@@ -987,7 +987,7 @@ fn with_discovered(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
 ) -> Vec<crate::domain::Installed> {
-    let scan = crate::os_discovery::scan(packages_root);
+    let scan = agent24_os_packages::discovery::scan(packages_root);
     for r in &scan.refused {
         tracing::warn!(
             "domain OS package at {} was not loaded: {}",
@@ -1055,7 +1055,7 @@ pub(crate) mod tests {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join(crate::os_discovery::MANIFEST_FILE),
+            dir.join(agent24_os_packages::discovery::MANIFEST_FILE),
             format!(
                 "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
                  event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
