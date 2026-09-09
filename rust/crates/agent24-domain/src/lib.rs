@@ -446,16 +446,14 @@ impl DomainOsManifest {
             .unwrap_or("<unnamed>")
             .to_owned();
 
+        // This read must stay ahead of the dispatch — the dispatch needs the value.
+        // A judgement call rides on that: `manifest_version: 1.0` is a YAML float,
+        // and it is refused as "must be a non-negative integer" even though this
+        // build supports v1. That is deliberate. The daemon does support v1; what it
+        // cannot accept is a version field that is not an integer, and saying so
+        // names the actual defect and the fix. Calling it `ManifestUnsupported`
+        // would claim the version is unsupported, which is false.
         let declared_schema = field_u32("manifest_version")?.unwrap_or(1);
-        if let Some(min) = field_u32("min_daemon_protocol")?
-            && min > u64::from(DAEMON_PROTOCOL_VERSION)
-        {
-            return Err(DomainError::ManifestUnsupported {
-                module,
-                requirement: format!("kernel protocol >= {min}"),
-                supported: format!("<= {DAEMON_PROTOCOL_VERSION}"),
-            });
-        }
 
         // Collected BEFORE the tree is consumed below. Cheap: one pass over the
         // top-level map. Used only on the error path (see there for why).
@@ -500,6 +498,31 @@ impl DomainOsManifest {
                     supported: format!("v1..=v{MANIFEST_SCHEMA_VERSION}"),
                 });
             }
+        }
+
+        // The protocol gate reads `min_daemon_protocol` — a field of THIS document
+        // — so it can only run once the version dispatch above has accepted the
+        // document's schema. It used to run BEFORE the dispatch, which had two
+        // consequences, and the second is the one that matters:
+        //
+        //  - A future manifest with a malformed `min_daemon_protocol` was told its
+        //    field was the wrong type, i.e. that it was a malformed document —
+        //    contradicting `ManifestUnsupported`'s own documentation, which says a
+        //    future manifest hitting an old daemon is NOT malformed.
+        //  - More fundamentally: reading that field out of a v7 document assumes v7
+        //    still spells it this way and still types it this way. This build was in
+        //    the middle of announcing that it cannot read v7. That is precisely the
+        //    reason §3 gives for why `<= current` cannot survive a field being
+        //    renamed or retyped — except it was not in the `<= current`, it was
+        //    three lines above it.
+        if let Some(min) = field_u32("min_daemon_protocol")?
+            && min > u64::from(DAEMON_PROTOCOL_VERSION)
+        {
+            return Err(DomainError::ManifestUnsupported {
+                module,
+                requirement: format!("kernel protocol >= {min}"),
+                supported: format!("<= {DAEMON_PROTOCOL_VERSION}"),
+            });
         }
 
         // ---- step two: the STRICT shape, now that the version is known-good ----
@@ -1151,6 +1174,47 @@ impl_kind: in_process_crate
             !msg.contains("warp_drive"),
             "the message must not blame the unknown field — that is the failure \
              mode gate 6 exists to prevent: {msg}"
+        );
+    }
+
+    #[test]
+    fn nothing_reads_a_future_documents_fields_before_refusing_its_version() {
+        // A build announcing "I cannot read v7" must not, in the same breath, have
+        // read a field OUT of that v7 document. Doing so assumes v7 still spells the
+        // field this way and still types it this way — the exact assumption §3 says
+        // `<= current` cannot survive.
+        //
+        // The visible symptom was narrower and easier to dismiss: a future manifest
+        // with a malformed `min_daemon_protocol` was told its FIELD was the wrong
+        // type, i.e. that the document was malformed — contradicting
+        // `ManifestUnsupported`'s own documentation.
+        let future = format!(
+            "{SIN90_YAML}manifest_version: {}\n",
+            MANIFEST_SCHEMA_VERSION + 1
+        );
+        for tail in ["min_daemon_protocol: 99\n", "min_daemon_protocol: nope\n"] {
+            let err = DomainOsManifest::from_yaml(&format!("{future}{tail}")).unwrap_err();
+            match &err {
+                DomainError::ManifestUnsupported { requirement, .. } => assert!(
+                    requirement.contains("manifest schema"),
+                    "the VERSION must be what is refused, not something read out of \
+                     a document whose version we just rejected: {requirement}"
+                ),
+                other => panic!("expected a version refusal, got {other:?}"),
+            }
+        }
+
+        // Control: at a version we DO support, the protocol gate must still fire.
+        // Without this, "the version answers first" is equally satisfied by having
+        // deleted the protocol gate altogether.
+        let err = DomainOsManifest::from_yaml(&format!(
+            "{SIN90_YAML}min_daemon_protocol: {}\n",
+            DAEMON_PROTOCOL_VERSION + 1
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("kernel protocol"),
+            "the protocol gate must still work at a supported version: {err}"
         );
     }
 
