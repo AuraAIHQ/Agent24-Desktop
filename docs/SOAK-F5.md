@@ -44,8 +44,23 @@ agent24 service install          # 装 LaunchAgent，登录即起、崩溃自拉
 agent24 service status           # 确认 running
 
 # 3) 造几条“日常”定时任务（泡测的负载——照你真实用途，至少覆盖各时段）
-#    经 CLI 或桌面端 Schedules 页建；例如每小时一条轻量 run、每天早/晚各一条。
-agent24 schedules list           # 确认 next_run_at 合理
+#    ⚠️ **`agent24 schedules` 这个子命令不存在**（2026-09-09 实测；CLI 只有
+#    chat/models/service/daemon/tui/os/mcp）。本文此前两处这么写，是错的。
+#    走 API 建（或桌面端 Schedules 页）：
+TOKEN=$(python3 -c "import json;print(json.load(open('$HOME/.agent24/daemon.json'))['token'])")
+PORT=$(python3 -c "import json;print(json.load(open('$HOME/.agent24/daemon.json'))['port'])")
+curl -s -X POST "http://127.0.0.1:$PORT/api/v1/schedules" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"soak-5min","enabled":true,
+       "spec":{"type":"every","secs":300},
+       "action":{"type":"agent_run",
+                 "prompt":"soak heartbeat: reply with the single word OK",
+                 "model_override":"Qwen3-0.6B-4bit"}}'
+curl -s "http://127.0.0.1:$PORT/api/v1/schedules" -H "Authorization: Bearer $TOKEN"   # 确认 next_run_at
+
+#    ⚠️ **必须至少建一条**：soak-monitor 要求 `schedule_min > 0` 才可能 PASS
+#    ——「没人建过 schedule 的泡测什么也证明不了」（脚本 :294 自己写着）。
+#    ⚠️ **钉死 model_override**：不钉的话 7 天里可能挑到 27B/35B，白烧内存和发热。
 
 # 4) 渠道授权（各一次）
 #    微信：起 wechat-bridge，首跑打印二维码，用微信扫码绑 bot（token 存本地，之后免扫）
@@ -119,11 +134,42 @@ $A24_SPEAKER_BIN identity list --json
 $A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
 ```
 
+### 🟢 relay：公共 relay 会限流，判据 6 会被第三方绑架（2026-09-09 实测）
+
+三条实测，都带正对照：
+
+| relay | 结果 |
+|---|---|
+| `wss://relay.aastar.io`（默认，iDoris 自己的） | **下线**。DNS 正常、TCP 443 通、WS 升级返回 **HTTP 530**（Cloudflare 源站不可达） |
+| `wss://relay.damus.io` | 第一次发成功，**接着连发三次全失败**（`503` + `publish: context deadline exceeded`）——限流 |
+| `ws://localhost:7447`（`bin/minirelay`） | 稳定。`sent=4 confirmed=3 lost=0 degraded_transitions=0` |
+
+canary 每 5 分钟一发、7 天两千次，打公共 relay 必然吃限流，于是 **`degraded` 会是 relay 的错而不是我们的错**，判据 6 被第三方可用性绑架。
+
+**结论：F5 用本地 minirelay。**
+
+```bash
+nohup ~/Dev/auraai/agent-speaker/bin/minirelay 7447 > ~/.agent24/minirelay.log 2>&1 &
+# 桥与 daemon 都指过去（必须同一个，不一致的症状与"通路真死了"一模一样）
+hyphae daemon --identity agent24 --notify=false --relay ws://localhost:7447
+A24_NOSTR_RELAY=ws://localhost:7447 pnpm --filter @agent24/nostr-bridge bridge
+```
+
+**代价要如实说**：本地 relay **测不到真实网络路径**（DNS、TLS、跨机 WS、睡眠后的连接僵尸）。它测的是「桥 ↔ hyphae daemon ↔ relay 这套机制本身活不活」。真实网络那一维要等 `relay.aastar.io` 恢复后单独补一轮——**别把本地 relay 跑绿了当成"Nostr 通路全程活着"**。
+
 ### 🟡 模型运行时：没有它，判据 2 会挂
 
 ```bash
 agent24 models        # 输出 "(no models — is a local LLM runtime running?)" 就是没有
 curl -s http://127.0.0.1:8088/v1/models | head -c 200
+```
+
+起法（`omlx start` 需要 GUI 的 oMLX.app；headless 用 `serve`，2026-09-09 实测可用）：
+
+```bash
+nohup omlx serve --port 8088 --api-key xiaobao8088 --memory-guard safe > ~/.agent24/omlx.log 2>&1 &
+agent24 models                                   # 要列出模型
+agent24 chat "reply with the single word OK" --model Qwen3-0.6B-4bit   # 端到端 2.4s
 ```
 
 泡测的定时任务要调模型。**连续失败 5 次，daemon 会把 schedule 置 `enabled=false, next_run_at=null`**——行还在，调度器已死，而判据 2 明确把 `auto_disabled` 判为失败。所以起跑前 oMLX（或 Ollama / LM Studio）必须在跑。
@@ -168,7 +214,7 @@ cat ~/.agent24/nostr-bridge-health-agent24.json | python3 -m json.tool
 pnpm --filter @agent24/wechat-bridge start   # 首跑打印二维码，用微信扫
 
 # 8) 定时任务 + 冒烟 + 起跑
-agent24 schedules list
+curl -s "http://127.0.0.1:$PORT/api/v1/schedules" -H "Authorization: Bearer $TOKEN"
 scripts/soak-monitor.sh --interval 60 --duration 3600      # 先 1 小时冒烟
 nohup scripts/soak-monitor.sh --log ~/agent24-soak.jsonl > ~/soak-monitor.out 2>&1 &
 ```
