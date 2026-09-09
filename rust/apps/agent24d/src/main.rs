@@ -9,6 +9,7 @@ mod events;
 mod mcp;
 mod os_config;
 mod os_discovery;
+mod os_install;
 mod os_memory;
 mod os_routes;
 mod overrides;
