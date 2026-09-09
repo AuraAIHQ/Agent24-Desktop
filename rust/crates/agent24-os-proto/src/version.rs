@@ -314,6 +314,19 @@ mod tests {
             "KIND is {:?}, which does not appear as a whole word in the SPEC sentence that names it",
             VersionMismatch::KIND
         );
+        // The sentence contains TWO backticked words — `-32000` and
+        // `version_mismatch` — so the assertion above accepts either. That is not
+        // a contrived gap: the code and the kind travel together, and mistaking
+        // one for the other is precisely the error their adjacency invites.
+        //
+        // The difference between them is not in the spelling, it is in the TYPE:
+        // a code parses as an integer, a kind does not. Asserting the shape
+        // narrows the sentence's acceptance set to one.
+        assert!(
+            VersionMismatch::KIND.parse::<i32>().is_err(),
+            "KIND is {:?}, which is a numeric CODE, not an `error.data.kind`",
+            VersionMismatch::KIND
+        );
     }
 
     #[test]
