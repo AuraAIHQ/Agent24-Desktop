@@ -78,11 +78,44 @@ pub fn scan(root: &Path) -> Scan {
         }
     };
 
-    let mut dirs: Vec<PathBuf> = entries
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| e.path())
-        .collect();
+    // Every entry is CLASSIFIED; nothing is dropped on the floor.
+    //
+    // `DirEntry::file_type()` does not follow symlinks, so the obvious
+    // `.filter(|e| e.is_dir())` silently discards a symlinked package directory —
+    // neither found nor refused, invisible in `agent24 os list`. That would make a
+    // THIRD cause of an empty catalogue ("the scanner could not see it") look
+    // exactly like the other two ("nothing installed", "everything refused"), which
+    // is the FU-32 mistake in a new place. It is also inconsistent: a symlinked
+    // MANIFEST is refused explicitly one level down.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for e in entries.filter_map(std::result::Result::ok) {
+        let path = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() => dirs.push(path),
+            Ok(t) if t.is_symlink() => out.refused.push(Refused {
+                dir: path,
+                // Refused rather than followed, for the reason the manifest-level
+                // check gives: a package's identity is decided by a file inside it,
+                // and a link lets that file live somewhere the packages root does
+                // not govern. The workaround is a copy, and the message says so
+                // because a developer who linked a work-in-progress module here
+                // needs to know what to do instead.
+                why: "package directory is a symlink; refusing to follow it (copy                       the directory instead)"
+                    .to_owned(),
+            }),
+            // A stray file in the packages root is a mistake worth naming — most
+            // often a stray archive or a manifest left at the top level.
+            Ok(_) => out.refused.push(Refused {
+                dir: path,
+                why: "not a directory; a package is a directory containing                       domain-os.yml"
+                    .to_owned(),
+            }),
+            Err(e) => out.refused.push(Refused {
+                dir: path,
+                why: format!("could not determine what this entry is: {e}"),
+            }),
+        }
+    }
     // Deterministic order: the scan feeds a catalogue whose duplicate handling
     // depends on which entry is seen first, so a filesystem's arbitrary readdir
     // order would make "which of two same-named packages wins" vary between runs
@@ -346,6 +379,60 @@ mod tests {
             scan.refused.iter().any(|r| r.why.contains("symlink")),
             "{:?}",
             scan.refused
+        );
+    }
+
+    #[test]
+    fn every_entry_is_classified_none_are_silently_dropped() {
+        // `DirEntry::file_type()` does not follow symlinks, so the obvious
+        // `.filter(|e| e.is_dir())` drops a symlinked package directory into
+        // NOTHING — not found, not refused, invisible in `agent24 os list`. That
+        // makes a THIRD cause of an empty catalogue ("the scanner could not see
+        // it") indistinguishable from the other two. It is also inconsistent: a
+        // symlinked MANIFEST is refused explicitly one level down.
+        //
+        // The property is 4-in / 4-seen, not "the symlink is refused" — the point
+        // is that nothing falls off the edge.
+        let root = tempfile::tempdir().unwrap();
+        install(
+            root.path(),
+            "good",
+            &manifest_yaml("good", "out_of_process_provider"),
+        );
+
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        install(
+            &elsewhere,
+            "real",
+            &manifest_yaml("real", "out_of_process_provider"),
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.join("real"), root.path().join("linked-pkg")).unwrap();
+
+        std::fs::write(root.path().join("stray.txt"), b"not a package").unwrap();
+
+        let scan = scan(root.path());
+        let seen: Vec<String> = scan
+            .found
+            .iter()
+            .map(|d| d.dir.clone())
+            .chain(scan.refused.iter().map(|r| r.dir.clone()))
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+
+        for entry in ["good", "linked-pkg", "stray.txt", "elsewhere"] {
+            assert!(
+                seen.contains(&entry.to_owned()),
+                "{entry} fell off the edge — it is neither found nor refused. \
+                 Seen: {seen:?}"
+            );
+        }
+        // Control: the one legitimate package still loads, or "everything is
+        // classified" would be satisfiable by refusing everything.
+        assert!(
+            scan.found.iter().any(|d| d.manifest.name() == "good"),
+            "the good package must still load"
         );
     }
 
