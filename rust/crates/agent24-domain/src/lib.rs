@@ -390,6 +390,18 @@ impl DomainOsManifest {
             });
         }
 
+        // Collected BEFORE the tree is consumed below. Cheap: one pass over the
+        // top-level map. Used only on the error path (see there for why).
+        let null_keys: Vec<String> = tree
+            .as_mapping()
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, v)| matches!(v, serde_yaml::Value::Null))
+                    .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // ---- step two: the STRICT shape, now that the version is known-good ----
         let raw: RawManifest = serde_yaml::from_value(tree).map_err(|e| {
             // `from_value` is the RIGHT deserializer here but it has one real
@@ -408,10 +420,31 @@ impl DomainOsManifest {
             //  - The cost is bounded: an expansion bomb never reaches here, because
             //    it already failed at the `from_str::<Value>` above. Only documents
             //    that parsed cleanly and then failed the SHAPE get the second read.
-            let located = serde_yaml::from_str::<RawManifest>(yaml.trim_start_matches('\u{feff}'))
-                .err()
-                .map(|located| located.to_string());
-            DomainError::Manifest(located.unwrap_or_else(|| e.to_string()))
+            if let Some(located) =
+                serde_yaml::from_str::<RawManifest>(yaml.trim_start_matches('\u{feff}'))
+                    .err()
+                    .map(|located| located.to_string())
+            {
+                return DomainError::Manifest(located);
+            }
+            // Nothing to borrow. This is not the rare case — it is exactly the
+            // case that needs help most, because `from_str` only has a message to
+            // lend when IT also refuses, and it is the LOOSER of the two. So the
+            // situations where `from_value` is stricter are precisely the ones
+            // where its bare message stands alone, and that message names no
+            // field: `name: ~` alone yields "invalid type: unit value, expected a
+            // string" — no line, no field, in a document with five string fields.
+            //
+            // Recover the field name from the tree instead. A YAML null is the one
+            // value that reaches serde as a type error with nothing to identify it,
+            // so listing the null-valued keys is enough to point at the culprit —
+            // and it needs no second copy of the field list, which is the trap the
+            // version gate was written to avoid.
+            DomainError::Manifest(if null_keys.is_empty() {
+                e.to_string()
+            } else {
+                format!("{e} — null-valued field(s): {}", null_keys.join(", "))
+            })
         })?;
 
         if !valid_name(&raw.name) {
@@ -842,7 +875,6 @@ impl_kind: in_process_crate
         assert_eq!(m.ui_entry(), None);
     }
 
-    #[test]
     // ---- ME-3a gate 6: manifest schema / protocol versioning ----------------
     //
     // The property under test is NOT "a bad version is rejected" — the strict
@@ -850,6 +882,7 @@ impl_kind: in_process_crate
     // manifest from the FUTURE produces a message naming the VERSION rather than
     // naming whichever unknown field happened to come first. See §3 gate 6 of
     // SPEC-ME3-OUT-OF-PROCESS.md.
+
     #[test]
     fn manifest_without_a_version_is_v1_and_still_loads() {
         // Every manifest written before the field existed. Making it required
@@ -1031,6 +1064,24 @@ impl_kind: in_process_crate
     }
 
     #[test]
+    fn a_nameless_type_error_still_names_the_field() {
+        // The case the borrowed message cannot help with, and the one that needs
+        // help most: `from_str` is the LOOSER deserializer, so it only has a
+        // message to lend when it ALSO refuses — never in the situations where
+        // `from_value` is the stricter one. `version: ~` alone yields
+        // "invalid type: unit value, expected a string": no line, no field, in a
+        // document with five string fields.
+        let yaml = SIN90_YAML.replace(r#"version: "0.2.1""#, "version: ~");
+        let msg = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(msg.contains("invalid type"), "{msg}");
+        assert!(
+            msg.contains("version"),
+            "a type error with no field name is a scavenger hunt across every \
+             string field; the null-valued key must be named: {msg}"
+        );
+    }
+
+    #[test]
     fn a_shape_error_keeps_its_line_and_column() {
         // `from_value` errors carry no position — the tree it walks has none. The
         // error path re-reads the text with `from_str` PURELY to borrow a located
@@ -1081,6 +1132,7 @@ impl_kind: in_process_crate
         ));
     }
 
+    #[test]
     fn manifest_cannot_claim_another_modules_event_name() {
         let yaml = SIN90_YAML.replace("event_module: sin90", "event_module: cos72");
         let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
