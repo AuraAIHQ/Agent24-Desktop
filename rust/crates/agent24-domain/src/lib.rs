@@ -94,6 +94,24 @@ pub enum DomainError {
     Manifest(String),
     #[error("manifest too large: {0}")]
     ManifestTooLarge(String),
+    /// The manifest declares a schema version, or a minimum daemon protocol,
+    /// that THIS build does not support.
+    ///
+    /// Distinct from [`Self::Manifest`] ON PURPOSE. A future manifest hitting an
+    /// old daemon is not a malformed document — it is a version mismatch, and the
+    /// operator needs to be told which side is behind. Folding it into a generic
+    /// serde error is what ME-3's gate 6 exists to prevent: the strict
+    /// [`RawManifest`] would reject an unknown field with a message about that
+    /// field, never mentioning that the daemon is simply too old.
+    #[error(
+        "manifest requires {requirement} (this daemon supports {supported}) — \
+         module {module:?} needs a newer agent24d"
+    )]
+    ManifestUnsupported {
+        module: String,
+        requirement: String,
+        supported: String,
+    },
     #[error("invalid event: {0}")]
     InvalidEvent(String),
     #[error("module store: {0}")]
@@ -150,6 +168,38 @@ pub enum ImplKind {
     OutOfProcessProvider,
 }
 
+/// The `domain-os.yml` SCHEMA version this build understands.
+///
+/// A manifest that omits `manifest_version` is treated as **v1** — every manifest
+/// written before this field existed is a v1 manifest, and making the field
+/// required would break every one of them at once.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// The kernel↔module PROTOCOL version this build speaks. Separate from the schema
+/// version: a manifest can be v1 while the protocol moves, and vice versa.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+
+/// The FIRST of two parse steps — deliberately TOLERANT.
+///
+/// It reads only the fields needed to decide "can this build even understand the
+/// rest?", and it must NOT carry `deny_unknown_fields`: a manifest from the
+/// future will have fields this build has never heard of, and the whole point of
+/// this step is to reach the version check BEFORE any of them cause a failure.
+/// Step two ([`RawManifest`]) is the strict one.
+///
+/// Every field is optional, including `name` — a manifest too broken to yield a
+/// name still has to produce a message better than a serde error, so the version
+/// gate reports `"<unnamed>"` rather than refusing to run.
+#[derive(Deserialize)]
+struct ManifestEnvelope {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    manifest_version: Option<u32>,
+    #[serde(default)]
+    min_daemon_protocol: Option<u32>,
+}
+
 /// The wire shape of `domain-os.yml`. PRIVATE, and the only MANIFEST type that
 /// derives `Deserialize`, so a caller cannot skip validation by deserializing
 /// straight into the validated type. `deny_unknown_fields` turns a typo like
@@ -173,6 +223,20 @@ struct RawManifest {
     #[serde(default)]
     ui_entry: Option<String>,
     impl_kind: ImplKind,
+    /// Declared here ONLY so `deny_unknown_fields` does not reject the very
+    /// fields step one just read. Their values are consumed by
+    /// [`ManifestEnvelope`]; re-reading them here would be reading the same
+    /// document twice and proving nothing, so they are deliberately never used.
+    ///
+    /// `allow(dead_code)` rather than `_`-prefixing: the names must match the YAML
+    /// keys for `deny_unknown_fields` to accept them, and a rename attribute to
+    /// achieve that would hide which key each one guards.
+    #[serde(default)]
+    #[allow(dead_code)]
+    manifest_version: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    min_daemon_protocol: Option<u32>,
 }
 
 /// A VALIDATED `domain-os.yml`.
@@ -266,6 +330,34 @@ impl DomainOsManifest {
                 Self::MAX_YAML_BYTES
             )));
         }
+        // ---- step one: TOLERANT envelope, only to reach the version gate ----
+        //
+        // Order is load-bearing. Parsing the strict shape first means a manifest
+        // from the future dies on an unknown field, with a message about that
+        // field and no hint that the daemon is the thing that is out of date.
+        let env: ManifestEnvelope = serde_yaml::from_str(yaml)
+            .map_err(|e| DomainError::Manifest(format!("could not read manifest envelope: {e}")))?;
+        let module = env.name.clone().unwrap_or_else(|| "<unnamed>".to_owned());
+
+        let declared_schema = env.manifest_version.unwrap_or(1);
+        if declared_schema > MANIFEST_SCHEMA_VERSION {
+            return Err(DomainError::ManifestUnsupported {
+                module,
+                requirement: format!("manifest schema v{declared_schema}"),
+                supported: format!("v{MANIFEST_SCHEMA_VERSION}"),
+            });
+        }
+        if let Some(min) = env.min_daemon_protocol
+            && min > DAEMON_PROTOCOL_VERSION
+        {
+            return Err(DomainError::ManifestUnsupported {
+                module,
+                requirement: format!("kernel protocol >= {min}"),
+                supported: format!("<= {DAEMON_PROTOCOL_VERSION}"),
+            });
+        }
+
+        // ---- step two: the STRICT shape, now that the version is known-good ----
         let raw: RawManifest =
             serde_yaml::from_str(yaml).map_err(|e| DomainError::Manifest(e.to_string()))?;
 
@@ -698,6 +790,125 @@ impl_kind: in_process_crate
     }
 
     #[test]
+    // ---- ME-3a gate 6: manifest schema / protocol versioning ----------------
+    //
+    // The property under test is NOT "a bad version is rejected" — the strict
+    // parse would reject it too, eventually, for the wrong reason. It is that a
+    // manifest from the FUTURE produces a message naming the VERSION rather than
+    // naming whichever unknown field happened to come first. See §3 gate 6 of
+    // SPEC-ME3-OUT-OF-PROCESS.md.
+    #[test]
+    fn manifest_without_a_version_is_v1_and_still_loads() {
+        // Every manifest written before the field existed. Making it required
+        // would break all of them at once, so absence MUST mean v1 — and it must
+        // not warn either, or upgrading the daemon lights up every module.
+        assert!(!SIN90_YAML.contains("manifest_version"));
+        let m = DomainOsManifest::from_yaml(SIN90_YAML).unwrap();
+        assert_eq!(m.name(), "sin90");
+    }
+
+    #[test]
+    fn manifest_version_equal_to_ours_loads() {
+        let yaml = format!("{SIN90_YAML}manifest_version: {MANIFEST_SCHEMA_VERSION}\n");
+        assert!(DomainOsManifest::from_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn manifest_from_the_future_names_the_version_not_a_stray_field() {
+        // The future manifest also carries a field this build has never heard of.
+        // That is the whole point: the STRICT shape would fail on `warp_drive`
+        // and say so, never mentioning that the daemon is simply too old.
+        let yaml = format!(
+            "{SIN90_YAML}manifest_version: {}\nwarp_drive: true\n",
+            MANIFEST_SCHEMA_VERSION + 1
+        );
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        match &err {
+            DomainError::ManifestUnsupported {
+                module,
+                requirement,
+                ..
+            } => {
+                assert_eq!(module, "sin90", "the operator needs to know WHICH module");
+                assert!(
+                    requirement.contains(&(MANIFEST_SCHEMA_VERSION + 1).to_string()),
+                    "requirement must name the version it wanted: {requirement}"
+                );
+            }
+            other => panic!("expected ManifestUnsupported, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("warp_drive"),
+            "the message must not blame the unknown field — that is the failure \
+             mode gate 6 exists to prevent: {msg}"
+        );
+    }
+
+    #[test]
+    fn min_daemon_protocol_above_ours_is_refused_with_both_numbers() {
+        let yaml = format!(
+            "{SIN90_YAML}min_daemon_protocol: {}\n",
+            DAEMON_PROTOCOL_VERSION + 1
+        );
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&(DAEMON_PROTOCOL_VERSION + 1).to_string())
+                && msg.contains(&DAEMON_PROTOCOL_VERSION.to_string()),
+            "both sides' versions must appear, or the operator cannot tell who is \
+             behind: {msg}"
+        );
+    }
+
+    #[test]
+    fn min_daemon_protocol_at_or_below_ours_loads() {
+        let yaml = format!("{SIN90_YAML}min_daemon_protocol: {DAEMON_PROTOCOL_VERSION}\n");
+        assert!(DomainOsManifest::from_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn an_unnamed_future_manifest_still_reports_a_version_error() {
+        // A manifest too broken to yield a name must still reach the version
+        // gate. Refusing to run the gate without a name would put us back where
+        // we started: an unreadable serde error.
+        let yaml = format!("manifest_version: {}\n", MANIFEST_SCHEMA_VERSION + 1);
+        match DomainOsManifest::from_yaml(&yaml).unwrap_err() {
+            DomainError::ManifestUnsupported { module, .. } => assert_eq!(module, "<unnamed>"),
+            other => panic!("expected ManifestUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_strict_shape_still_rejects_unknown_fields_at_a_supported_version() {
+        // The tolerant envelope must not have loosened step two. Same stray field
+        // as the future-manifest test, but at a version we DO support: now it is
+        // a genuine typo and must fail, naming the field.
+        let yaml = format!("{SIN90_YAML}warp_drive: true\n");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        assert!(
+            matches!(err, DomainError::Manifest(_)),
+            "a stray field at a supported version is a malformed manifest, not a \
+             version mismatch: {err:?}"
+        );
+        assert!(err.to_string().contains("warp_drive"), "{err}");
+    }
+
+    #[test]
+    fn the_version_gate_runs_before_the_size_check_does_not_regress() {
+        // Order matters the other way too: an oversized document must still be
+        // refused for its SIZE, not parsed by the tolerant envelope first.
+        let yaml = format!(
+            "{}\n{}",
+            SIN90_YAML,
+            "#".repeat(DomainOsManifest::MAX_YAML_BYTES)
+        );
+        assert!(matches!(
+            DomainOsManifest::from_yaml(&yaml).unwrap_err(),
+            DomainError::ManifestTooLarge(_)
+        ));
+    }
+
     fn manifest_cannot_claim_another_modules_event_name() {
         let yaml = SIN90_YAML.replace("event_module: sin90", "event_module: cos72");
         let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
