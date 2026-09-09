@@ -105,14 +105,21 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // that borrowed guarantee disappears with no symptom except packages missing a
     // few files. Cheaper not to share the path in the first place.
     let staging = staging_path(packages_root, manifest.name());
-    // Unreachable in practice — the counter is monotonic within the process and the
-    // pid separates processes — but a crashed predecessor can leave an OLDER
-    // staging directory behind. Those are not this call's to delete: removing a
-    // path it did not create is how the shared-path race got its accidental
-    // safety, and this function should not rely on that a second time.
-    if staging.exists() {
-        remove_quietly(&staging);
-    }
+    // Sweep debris from a PREVIOUS process before staging a new one.
+    //
+    // Adding the counter made the old `if staging.exists()` line dead — the path is
+    // unique per call, so it never exists. But the debris it used to remove is
+    // still produced: a daemon killed mid-copy leaves `.staging-*` behind forever.
+    // That is not merely untidy. Until the scanner learned to refuse dot-prefixed
+    // directories, such wreckage was DISCOVERED as a package — with a valid
+    // manifest, since the manifest is copied first — and `.` sorting before every
+    // letter meant it beat the real package to the name.
+    //
+    // Only this process's own leftovers are removed. Another daemon may be staging
+    // right now, and deleting a live staging directory is exactly the accidental
+    // "safety through the other party failing" that the counter was added to stop
+    // relying on.
+    sweep_own_stale_staging(packages_root);
     copy_tree(src, &staging).inspect_err(|_| remove_quietly(&staging))?;
 
     // NOTE, so nobody mistakes where the guarantee comes from: today's atomicity
@@ -167,6 +174,28 @@ fn staging_path(packages_root: &Path, name: &str) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     packages_root.join(format!(".staging-{name}-{}-{seq}", std::process::id()))
+}
+
+/// Remove staging directories left by an EARLIER RUN OF THIS PROCESS ID.
+///
+/// Scoped to this pid on purpose: another daemon may be staging concurrently, and
+/// removing a live staging tree is precisely the "one party wins because the other
+/// fails entirely" behaviour the per-call counter exists to stop depending on. A
+/// different pid's debris is left for the operator, who sees it named in the
+/// scanner's refusal list.
+fn sweep_own_stale_staging(packages_root: &Path) {
+    let prefix = ".staging-";
+    let me = format!("-{}-", std::process::id());
+    let Ok(entries) = std::fs::read_dir(packages_root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(prefix) && name.contains(&me) {
+            remove_quietly(&e.path());
+        }
+    }
 }
 
 /// Best-effort cleanup. A failure here is not reported: the caller is already
@@ -483,6 +512,36 @@ mod tests {
         // And it must still be inside the packages root, or atomicity is gone.
         assert_eq!(a.parent(), Some(root));
         assert_eq!(b.parent(), Some(root));
+    }
+
+    #[test]
+    fn a_new_install_sweeps_this_processs_own_stale_staging() {
+        // Debris outlives the process that made it. Adding the per-call counter
+        // made the old `if staging.exists()` check dead — the path is unique now —
+        // so nothing was cleaning up after a crash any more.
+        let t = tempfile::tempdir().unwrap();
+        let pkgs = t.path().join("packages");
+        std::fs::create_dir_all(&pkgs).unwrap();
+
+        let mine = pkgs.join(format!(".staging-cos72-{}-0", std::process::id()));
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("junk"), b"half a package").unwrap();
+
+        // Another daemon's debris. NOT ours to delete: it may be staging right now,
+        // and removing a live staging tree is exactly the "the other party fails
+        // entirely" behaviour the counter was added to stop depending on.
+        let theirs = pkgs.join(".staging-cos72-999999-0");
+        std::fs::create_dir_all(&theirs).unwrap();
+
+        let src = src_pkg(t.path(), "src", "cos72");
+        install(&src, &pkgs).unwrap();
+
+        assert!(!mine.exists(), "our own stale staging must be swept");
+        assert!(
+            theirs.exists(),
+            "another process's staging must be left alone — it may be live"
+        );
+        assert!(pkgs.join("cos72").join(MANIFEST_FILE).is_file());
     }
 
     #[test]
