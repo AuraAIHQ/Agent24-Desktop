@@ -731,7 +731,7 @@ pub async fn serve(
     // ME-3a: the catalogue is no longer only what was compiled in. The merge is a
     // free function so it can be tested without standing up a daemon — see
     // `with_discovered`.
-    let packages_root = os_packages_root(&state_dir, ephemeral);
+    let packages_root = agent24_os_packages::packages_root(&state_dir, ephemeral);
     let catalogue = with_discovered(catalogue, &packages_root);
 
     let os_config_path =
@@ -1016,33 +1016,6 @@ fn with_discovered(
         });
     }
     catalogue
-}
-
-/// Where installed domain-OS PACKAGES live — deliberately NOT the same root as
-/// their data.
-///
-/// Data lives in `~/.agent24/os/<name>/`, which the module owns and writes to.
-/// A package holds the manifest, and the manifest is what DECIDES the module's
-/// name, namespace and data directory. Putting the two in one tree would let a
-/// module rewrite its own identity at runtime by writing one file into the
-/// directory it was handed — so the manifest must live somewhere the module is
-/// not given a handle to.
-///
-/// `A24_OS_PACKAGES` overrides it. That is not a convenience: it is what lets a
-/// test install a package into a temp dir and prove the catalogue is read at
-/// startup rather than compiled in, WITHOUT rebuilding the binary.
-fn os_packages_root(state_dir: &std::path::Path, ephemeral: bool) -> std::path::PathBuf {
-    if let Some(over) = std::env::var_os("A24_OS_PACKAGES") {
-        return std::path::PathBuf::from(over);
-    }
-    if ephemeral {
-        // An ephemeral daemon must not read the real user's packages: it is used
-        // by tests and by `agent24 chat` with no daemon running, and silently
-        // mounting whatever the user happens to have installed would make those
-        // runs depend on machine state they never asked about.
-        return std::env::temp_dir().join(format!("agent24-ephemeral-pkgs-{}", std::process::id()));
-    }
-    state_dir.join("packages")
 }
 
 #[cfg(test)]

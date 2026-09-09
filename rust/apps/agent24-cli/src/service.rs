@@ -117,7 +117,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 7] = [
+pub const PASSTHROUGH_VARS: [&str; 8] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
@@ -125,6 +125,11 @@ pub const PASSTHROUGH_VARS: [&str; 7] = [
     "A24_GUARDIAN_ALWAYS_REVIEW",
     "A24_APPROVAL_TIMEOUT_SECS",
     "A24_SCHEDULER_TICK_SECS",
+    // ME-3a. Missing it meant `agent24 os install` wrote to the override
+    // directory while the launchd-started daemon kept scanning
+    // `~/.agent24/packages` — and the CLI still printed "it takes effect at the
+    // next daemon start".
+    "A24_OS_PACKAGES",
 ];
 
 /// Snapshot the environment the daemon should run with.
@@ -328,22 +333,135 @@ mod tests {
         assert!(!p.contains("exec&<fs"));
     }
 
+    /// Every environment variable the daemon side READS must be in
+    /// `PASSTHROUGH_VARS`, because launchd hands a LaunchAgent none of the login
+    /// shell's environment.
+    ///
+    /// This scans the SOURCE rather than listing the names a second time. The list
+    /// it replaced was a hand-copy of the constant, so it could only fail if a
+    /// name were deleted from the constant — it could never notice one that was
+    /// never added, and that is exactly how this list drifted: the daemon read
+    /// `A24_OS_PACKAGES` while the old test stayed green.
+    ///
+    /// It resolves `env::var(SOME_CONST)` as well as a string literal. That is not
+    /// speculative generality: the first version only understood literals, and the
+    /// very next commit turned one read into a `const` reference — the positive
+    /// control below fired within the hour. A scanner that only sees one spelling
+    /// of the thing it looks for goes quiet exactly when the code is refactored.
     #[test]
     fn passthrough_list_matches_what_the_daemon_actually_reads() {
-        // Guard against drift: these are the vars grepped out of the daemon.
-        for v in [
-            "OMLX_URL",
-            "OMLX_API_KEY",
-            "DEFAULT_MODEL",
-            "A24_GUARDIAN",
-            "A24_GUARDIAN_ALWAYS_REVIEW",
-            "A24_APPROVAL_TIMEOUT_SECS",
-            "A24_SCHEDULER_TICK_SECS",
-        ] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut sources: Vec<String> = Vec::new();
+        for dir in ["apps/agent24d/src", "crates"] {
+            walk_rs(&root.join(dir), &mut |path| {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    sources.push(text);
+                }
+            });
+        }
+        // Positive control #1: an empty corpus makes every assertion below vacuous,
+        // and a renamed directory is how that happens with no other symptom.
+        assert!(
+            sources.len() > 10,
+            "scanned only {} files — the paths are wrong",
+            sources.len()
+        );
+
+        // `const NAME: &str = "VALUE";` — so an env read spelled as a constant can
+        // be resolved back to the variable it names.
+        let mut consts: Vec<(String, String)> = Vec::new();
+        for text in &sources {
+            let mut rest = text.as_str();
+            while let Some(i) = rest.find("const ") {
+                rest = &rest[i + "const ".len()..];
+                let Some((decl, after)) = rest.split_once('=') else {
+                    break;
+                };
+                if !decl.contains("&str") {
+                    continue;
+                }
+                let Some(name) = decl.split(':').next().map(str::trim) else {
+                    continue;
+                };
+                let after = after.trim_start();
+                if let Some(lit) = after.strip_prefix('"').and_then(|r| r.split('"').next()) {
+                    consts.push((name.to_owned(), lit.to_owned()));
+                }
+            }
+        }
+
+        let mut found: Vec<String> = Vec::new();
+        for text in &sources {
+            for pat in ["env::var(", "env::var_os("] {
+                let mut rest = text.as_str();
+                while let Some(i) = rest.find(pat) {
+                    rest = &rest[i + pat.len()..];
+                    let Some(end) = rest.find(')') else { break };
+                    let arg = rest[..end].trim();
+                    let name = match arg.strip_prefix('"').and_then(|r| r.split('"').next()) {
+                        Some(lit) => Some(lit.to_owned()),
+                        // A constant: resolve it, or fail loudly. Silently ignoring
+                        // an unresolvable read is how this test would go quiet the
+                        // next time the spelling changes again.
+                        None => {
+                            let ident = arg.rsplit("::").next().unwrap_or(arg);
+                            let hit = consts
+                                .iter()
+                                .find(|(n, _)| n == ident)
+                                .map(|(_, v)| v.clone());
+                            assert!(
+                                hit.is_some()
+                                    || !ident.chars().all(|c| c.is_ascii_uppercase()
+                                        || c.is_ascii_digit()
+                                        || c == '_'),
+                                "an env read spelled `{arg}` could not be resolved to a name; \
+                                 this test cannot see what it forwards"
+                            );
+                            hit
+                        }
+                    };
+                    // HOME is not ours to forward: launchd sets it itself.
+                    if let Some(name) = name {
+                        let shouty = !name.is_empty()
+                            && name
+                                .chars()
+                                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                        if shouty && name != "HOME" {
+                            found.push(name);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Positive control #2: a variable known to be read must come out of the
+        // scan. This is what caught the literal-only version above.
+        assert!(
+            found.iter().any(|v| v == "A24_OS_PACKAGES"),
+            "the scan did not find a variable known to be read: {found:?}"
+        );
+        found.sort();
+        found.dedup();
+        for v in &found {
             assert!(
-                PASSTHROUGH_VARS.contains(&v),
-                "{v} missing from passthrough"
+                PASSTHROUGH_VARS.contains(&v.as_str()),
+                "{v} is read by the daemon but is not in PASSTHROUGH_VARS; a \
+                 LaunchAgent-started daemon would never see it"
             );
+        }
+    }
+
+    fn walk_rs(dir: &Path, f: &mut impl FnMut(&Path)) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk_rs(&p, f);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                f(&p);
+            }
         }
     }
 

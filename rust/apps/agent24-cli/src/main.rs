@@ -5,6 +5,7 @@
 //! - Standalone: no daemon found → spawn an ephemeral agent24d for this
 //!   invocation and terminate it afterwards
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -66,6 +67,14 @@ enum Command {
 enum OsAction {
     /// Show every domain OS the daemon knows about, and what it did with each
     List,
+    // EXPIRES WITH ME-3b. Both "applies at the next daemon start" lines below are
+    // true TODAY for one reason only: a toggle is written to the config and
+    // nothing acts on a running module, so a restart is the only path by which it
+    // takes effect. ME-3's two-phase hot disable (SPEC §4, delivered in ME-3b's
+    // last slice) makes disable act immediately — at which point these two lines
+    // become false with no test to notice, because no test can assert what a help
+    // string promises. The note lives here rather than in the follow-ups ledger so
+    // that it is read by whoever changes the thing that makes it false.
     /// Turn one on (applies at the next daemon start)
     Enable {
         /// Module name, e.g. sin90
@@ -73,6 +82,19 @@ enum OsAction {
     },
     /// Turn one off (applies at the next daemon start)
     Disable { name: String },
+    /// Install a domain-OS package directory (takes effect at the next daemon start)
+    ///
+    /// Unlike list/enable/disable this does NOT go through the daemon, and does not
+    /// need one running. Installing writes files; the daemon reads them when it
+    /// starts. Routing it through the daemon would make writing depend on someone
+    /// reading — and would mean you cannot install a module while the daemon is
+    /// down, which is exactly when you are most likely to be fixing one.
+    Install {
+        /// Directory containing `domain-os.yml`
+        path: PathBuf,
+    },
+    /// Remove an installed domain-OS package (takes effect at the next daemon start)
+    Uninstall { name: String },
 }
 
 #[derive(Subcommand)]
@@ -298,12 +320,86 @@ async fn cmd_models() -> Result<(), String> {
     out
 }
 
+/// `agent24 os install` / `os uninstall` — the two that do NOT go through the
+/// daemon.
+///
+/// Installing writes files into the packages root; the daemon reads them when it
+/// next starts. Making this an RPC would make writing depend on someone reading,
+/// and would mean a module cannot be installed or removed while the daemon is
+/// down — which is exactly when an operator is most likely to be fixing one.
+///
+/// Every decision lives in `agent24-os-packages`: which directory to write to,
+/// what the installed name is (the manifest's, not the source directory's), and
+/// whether one is already there. This function maps arguments onto that and
+/// prints the result. If it ever needs to compute a path or check for a duplicate
+/// itself, the seam is in the wrong place and that logic belongs in the library.
+fn os_local(action: &OsAction) -> Option<Result<(), String>> {
+    // The state dir is OPTIONAL here, and passing it as an option rather than
+    // resolving it first is the whole difference: `A24_OS_PACKAGES` is consulted
+    // before it, so a container or CI runner with the override set and no `HOME`
+    // installs into the directory it asked for. Resolving `state_dir()` first
+    // reimposed the `HOME` requirement that the override exists to lift, and
+    // reported it with a message identical to the one for "neither is set" —
+    // indistinguishable outputs for two situations, one of which was wrong.
+    let root = match agent24_os_packages::resolve_packages_root(
+        agent24_os_packages::env_override().as_deref(),
+        state_file::state_dir().as_deref(),
+        false,
+    ) {
+        Ok(root) => root,
+        Err(e) => {
+            return Some(Err(format!(
+                "{e} (set HOME, or set {})",
+                agent24_os_packages::PACKAGES_ROOT_ENV
+            )));
+        }
+    };
+    match action {
+        OsAction::Install { path } => Some(
+            agent24_os_packages::install::install(path, &root)
+                .map(|dest| {
+                    println!("installed {}", dest.display());
+                    println!("  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start");
+                    // Said out loud because the isolation is deliberate and
+                    // therefore permanent: an ephemeral daemon (`agent24 chat`
+                    // with nothing running) resolves a different packages root
+                    // and will never see this package. Without this line the two
+                    // lines above are, for that user, a promise that never comes
+                    // true.
+                    println!("  (a daemon started implicitly by `agent24 chat` does NOT read installed packages)");
+                })
+                .map_err(|e| e.to_string()),
+        ),
+        OsAction::Uninstall { name } => Some(
+            agent24_os_packages::install::uninstall(name, &root)
+                .map(|removed| {
+                    if removed {
+                        println!("removed {name}");
+                        println!("  it takes effect at the next daemon start");
+                    } else {
+                        // Not an error: the end state the operator asked for is the
+                        // one they have. Saying so beats a failure they must decide
+                        // to ignore.
+                        println!("{name} was not installed; nothing to remove");
+                    }
+                })
+                .map_err(|e| e.to_string()),
+        ),
+        _ => None,
+    }
+}
+
 /// `agent24 os` — read and toggle the domain-OS registry.
 ///
-/// Everything goes through the daemon; this never touches `os.json`. That is
-/// what makes `agent24 os disable sin09` fail HERE, naming the modules that do
-/// exist, instead of writing a file that breaks the registry at the next start.
+/// `list` / `enable` / `disable` go through the daemon; this never touches
+/// `os.json`. That is what makes `agent24 os disable sin09` fail HERE, naming the
+/// modules that do exist, instead of writing a file that breaks the registry at
+/// the next start. `install` / `uninstall` are different in kind and are handled
+/// by [`os_local`] before any of that.
 async fn cmd_os(action: OsAction) -> Result<(), String> {
+    if let Some(done) = os_local(&action) {
+        return done;
+    }
     let ep = match connect().await {
         Ok(ep) => ep,
         // The bootstrapping case, and it is the one that matters most: if a domain
@@ -324,6 +420,8 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         }
     };
     let req = match &action {
+        // Handled before the daemon lookup above; see `os_local`.
+        OsAction::Install { .. } | OsAction::Uninstall { .. } => unreachable!(),
         OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let enabled = matches!(action, OsAction::Enable { .. });
@@ -371,6 +469,14 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
 /// would otherwise print a broken document.
 fn offline_hint(path: &str, action: &OsAction) -> String {
     match action {
+        // Unreachable: `os_local` handles these before `cmd_os` ever looks for a
+        // daemon, so an offline hint is never needed for them. Spelled out rather
+        // than caught by a `_` arm — a `_` here would silently swallow a FUTURE
+        // subcommand that really does need a hint, and the compiler is the only
+        // thing that would otherwise have noticed. (It noticed this one.)
+        OsAction::Install { .. } | OsAction::Uninstall { .. } => {
+            "this command does not need the daemon".to_owned()
+        }
         OsAction::List => format!("read {path} to see what is configured"),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());

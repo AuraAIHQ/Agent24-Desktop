@@ -4,9 +4,16 @@
 //! **Atomic**: a package is either fully installed or not installed. There is no
 //! state in which the packages root holds half of one.
 //!
-//! **Clean on failure**: a refused install leaves the packages root byte-for-byte
-//! as it was. Not a partial directory, not a `.tmp`, not a changed mtime on the
-//! parent.
+//! **Clean on failure**: a refused install leaves no ENTRY behind in the packages
+//! root — not a partial directory, not a `.tmp` — and if the root itself did not
+//! exist beforehand, it does not exist afterwards either.
+//!
+//! An earlier version of this sentence also promised an unchanged mtime on the
+//! parent. That was never true and nothing tested it: staging is created INSIDE
+//! the packages root (which is what makes the final `rename` atomic), so creating
+//! and removing it necessarily touches the root's mtime. The claim is dropped
+//! rather than weakened, because the property that matters — nothing left over —
+//! is the one the tests actually check.
 //!
 //! The second is the one that is easy to write a decorative test for. Asserting
 //! that this function returned `Err` says nothing about what it left on disk, so
@@ -15,14 +22,6 @@
 //! controls of its own — see `the_snapshot_sees_each_kind_of_difference` in this
 //! file's test module. (Not a rustdoc link: the test module does not exist in a
 //! doc build, so a link there is one that can never resolve.)
-
-// TEMPORARY, and it must not outlive the next commit. Nothing calls this yet:
-// the CLI that will (`agent24 os install`) is deliberately a separate change, so
-// that the filesystem properties here and the argument/output contract there can
-// each be reviewed against their own kind of failure. If this attribute is still
-// here after the CLI lands, something was dropped — the intended callers are
-// `os install` / `os uninstall`.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +34,11 @@ use agent24_domain::DomainOsManifest;
 pub enum InstallError {
     /// The source is not a package this kernel will accept.
     Source(String),
+    /// The string given is not a module name at all, so it names nothing that
+    /// could be installed. Separate from `Source` because `uninstall` has no
+    /// source: reporting a refused NAME as a refused PACKAGE told the operator to
+    /// go and look at a directory that was never the problem.
+    InvalidName(String),
     /// A package by that name is already installed.
     AlreadyInstalled(String),
     /// The filesystem refused, or the staging directory and the destination are
@@ -46,6 +50,10 @@ impl std::fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(s) => write!(f, "source package rejected: {s}"),
+            Self::InvalidName(n) => write!(
+                f,
+                "{n:?} is not a valid module name, so it cannot name an installed package"
+            ),
             Self::AlreadyInstalled(n) => write!(
                 f,
                 "a domain OS named {n:?} is already installed; uninstall it first"
@@ -87,12 +95,26 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
         DomainOsManifest::from_yaml(&text).map_err(|e| InstallError::Source(e.to_string()))?;
 
     let dest = packages_root.join(manifest.name());
-    if dest.exists() {
+    if entry_exists(&dest)? {
         return Err(InstallError::AlreadyInstalled(manifest.name().to_owned()));
     }
 
+    // Whether the root existed BEFORE this call decides what a failure has to
+    // clean up. If this call created it, a later failure must take it away again:
+    // the promise is that a refused install leaves no trace, and an empty
+    // `packages/` directory that only exists because someone tried once is a
+    // trace.
+    let root_existed = entry_exists(packages_root).unwrap_or(true);
     std::fs::create_dir_all(packages_root)
         .map_err(|e| InstallError::Filesystem(format!("could not create packages root: {e}")))?;
+    let undo_root = || {
+        if !root_existed {
+            // `remove_dir` (not `_all`): it only succeeds while the directory is
+            // still empty, so a concurrent install that already put something
+            // there is never destroyed by our cleanup.
+            let _ = std::fs::remove_dir(packages_root);
+        }
+    };
 
     // Staging lives INSIDE the packages root, not in the system temp directory.
     // That is the whole point: `/tmp` is frequently a different volume (it is on
@@ -126,7 +148,10 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // it must separate carry identical names. Crash debris is instead left for the
     // operator: it is inert (the scanner refuses dot-prefixed directories) and it is
     // visible by name in the scan's refusal list.
-    copy_tree(src, &staging).inspect_err(|_| remove_quietly(&staging))?;
+    copy_tree(src, &staging).inspect_err(|_| {
+        remove_quietly(&staging);
+        undo_root();
+    })?;
 
     // NOTE, so nobody mistakes where the guarantee comes from: today's atomicity
     // comes from staging being CONSTRUCTED inside the destination's parent, not
@@ -142,6 +167,7 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
     // visible symptom.
     if !same_device(&staging, packages_root).unwrap_or(false) {
         remove_quietly(&staging);
+        undo_root();
         return Err(InstallError::Filesystem(
             "staging directory is on a different filesystem from the packages root; \
              a rename across filesystems is not atomic"
@@ -151,6 +177,7 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
 
     std::fs::rename(&staging, &dest).map_err(|e| {
         remove_quietly(&staging);
+        undo_root();
         InstallError::Filesystem(format!("could not move the package into place: {e}"))
     })?;
     Ok(dest)
@@ -158,15 +185,67 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
 
 /// Remove an installed package. Missing is not an error the caller has to handle
 /// differently from removed — both end with "it is not installed".
+///
+/// # Why the name is validated here and not left to the caller
+///
+/// `install` never takes a name: it reads one out of a validated manifest. So
+/// until this function existed, "what may be a package name" was decided in
+/// exactly one place. `uninstall` takes a name as a STRING, and a string joined
+/// onto a path is not a name — `Path::join` replaces the whole path when given an
+/// absolute one, and `..` walks out of the root. With `remove_dir_all` on the
+/// other end, `uninstall("/somewhere/else")` deletes `/somewhere/else` and reports
+/// success.
+///
+/// The rule used is [`agent24_domain::is_valid_module_name`] — the same one the
+/// manifest is held to, deliberately not a new "does it look like a path" check.
+/// A second, weaker definition of "package name" is how the two drift apart.
 pub fn uninstall(name: &str, packages_root: &Path) -> Result<bool, InstallError> {
+    if !agent24_domain::is_valid_module_name(name) {
+        return Err(InstallError::InvalidName(name.to_owned()));
+    }
     let dest = packages_root.join(name);
-    if !dest.exists() {
+    if !entry_exists(&dest)? {
         return Ok(false);
     }
-    std::fs::remove_dir_all(&dest).map_err(|e| {
+    // Removal is staged the same way installation is, and for the same reason:
+    // `remove_dir_all` is not atomic. Half way through it can hit a permission
+    // error or an I/O error and return `Err` having already deleted files — and
+    // what is left behind is neither installed nor uninstalled. A daemon starting
+    // at that moment scans a half package. Renaming first makes the package
+    // disappear in one step; whatever the cleanup then fails to delete is inert
+    // debris the scanner refuses by name.
+    let doomed = staging_path(packages_root, name);
+    // `rename` moves the ENTRY, so this works on a symlink (dangling or not) just
+    // as it does on a directory — which is why the removal below has to handle
+    // both kinds too.
+    std::fs::rename(&dest, &doomed).map_err(|e| {
         InstallError::Filesystem(format!("could not remove {}: {e}", dest.display()))
     })?;
+    remove_quietly(&doomed);
     Ok(true)
+}
+
+/// Is there an ENTRY at this path — regardless of whether it can be followed?
+///
+/// Neither `exists` nor `try_exists` answers that question. Both follow symlinks,
+/// so a package directory that is a symlink to a deleted target reads as absent,
+/// and `exists` additionally turns "I could not find out" (no search permission
+/// on a parent, an I/O error) into `false`. Either way `uninstall` would report
+/// "was not installed" about an entry the scanner DOES see and refuse — a package
+/// the operator can neither use nor remove.
+///
+/// `symlink_metadata` asks about the entry itself. `NotFound` is the only error
+/// that means absent; every other one is propagated, because not knowing is a
+/// third outcome and hiding it inside `false` is what created this bug class.
+fn entry_exists(path: &Path) -> Result<bool, InstallError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(InstallError::Filesystem(format!(
+            "could not determine whether {} exists: {e}",
+            path.display()
+        ))),
+    }
 }
 
 /// A staging path that NO other call will ever produce.
@@ -186,6 +265,13 @@ fn staging_path(packages_root: &Path, name: &str) -> PathBuf {
 /// returning an error, and replacing "the install failed because X" with "cleanup
 /// failed" would hide the reason the operator needs.
 fn remove_quietly(p: &Path) {
+    // A `remove_file` fallback was added here for the case where the entry is a
+    // symlink rather than a directory, and then removed: `remove_dir_all` "does
+    // not follow symbolic links and will simply remove the symbolic link itself"
+    // (std docs, and measured — a mutation that dropped the fallback killed no
+    // test because there is nothing for it to do). Defensive code whose failure
+    // case cannot be reached is not free: it says a hazard exists where none does,
+    // and the next reader budgets for it.
     let _ = std::fs::remove_dir_all(p);
 }
 
@@ -256,8 +342,9 @@ mod tests {
     /// block boundary, a file pre-allocated then partially filled), and without a
     /// hash "the set is equal" would hold across exactly the partial state this
     /// module exists to prevent. mtime is deliberately NOT in the tuple: it makes
-    /// the snapshot unstable on fast filesystems, and the parent-mtime question is
-    /// asked separately below.
+    /// the snapshot unstable on fast filesystems — and, unlike what an earlier
+    /// version of this comment said, nothing below asks the parent-mtime question
+    /// separately. It cannot be asked: staging lives inside the root by design.
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct Entry {
         rel: String,
@@ -654,6 +741,105 @@ mod tests {
         assert!(
             !uninstall("cos72", &pkgs).unwrap(),
             "removing something absent is not an error, but must be distinguishable"
+        );
+    }
+
+    /// The name is user-controlled and `remove_dir_all` is irreversible, so this
+    /// is written with both controls: the two escapes must FAIL and leave the
+    /// victim alone, and the ordinary removal must still work — a `uninstall`
+    /// that refused everything would pass the first half on its own.
+    #[test]
+    fn uninstall_cannot_be_talked_out_of_the_packages_root() {
+        let t = tempfile::tempdir().unwrap();
+        let pkgs = t.path().join("packages");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        let victim = t.path().join("VICTIM");
+        std::fs::create_dir_all(victim.join("precious")).unwrap();
+        let abs = victim.to_string_lossy().into_owned();
+
+        for probe in ["../VICTIM", abs.as_str(), "", ".", "..", "/"] {
+            let err = uninstall(probe, &pkgs)
+                .expect_err(&format!("{probe:?} must be refused, not resolved"));
+            assert!(
+                matches!(err, InstallError::InvalidName(_)),
+                "{probe:?} → {err:?}"
+            );
+        }
+        assert!(
+            victim.join("precious").exists(),
+            "an escape deleted a directory outside the packages root"
+        );
+
+        // Controls: refusing everything would also satisfy the assertions above.
+        let src = src_pkg(t.path(), "src", "cos72");
+        install(&src, &pkgs).unwrap();
+        assert!(
+            uninstall("cos72", &pkgs).unwrap(),
+            "a real name still removes"
+        );
+        assert!(
+            !uninstall("cos72", &pkgs).unwrap(),
+            "an absent-but-valid name is still Ok(false), not an error"
+        );
+    }
+
+    /// A dangling symlink where a package directory should be is the case
+    /// `Path::exists` gets wrong: it answers `false` for "the target is missing"
+    /// just as it does for "there is nothing here". The scanner DOES see the
+    /// entry and refuses it, so reporting "was not installed" would leave the
+    /// operator with a package they can neither use nor remove.
+    #[test]
+    fn a_package_entry_that_cannot_be_inspected_is_not_reported_as_absent() {
+        let t = tempfile::tempdir().unwrap();
+        let pkgs = t.path().join("packages");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        std::os::unix::fs::symlink(t.path().join("nowhere"), pkgs.join("cos72")).unwrap();
+
+        let removed = uninstall("cos72", &pkgs).expect("a broken link is removable, not invisible");
+        assert!(
+            removed,
+            "it was there — a dangling link is not 'not installed'"
+        );
+        // Not "the path is gone": the removal RENAMES first, so the original path
+        // is empty either way and asserting only that would pass even if the entry
+        // were merely moved and left behind. What has to hold is that the packages
+        // root is EMPTY — a mutation that dropped the symlink branch of the
+        // cleanup passed the weaker assertion, which is how this one got written.
+        let left: Vec<_> = std::fs::read_dir(&pkgs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "uninstall reported success and left {left:?} behind"
+        );
+    }
+
+    /// The failure path has to undo the directory it created. Asserted with the
+    /// control that makes it meaningful: when the root ALREADY existed, a failed
+    /// install must not delete it.
+    #[test]
+    fn a_failed_install_does_not_leave_a_packages_root_it_created() {
+        let t = tempfile::tempdir().unwrap();
+        // A valid manifest with a symlink inside — accepted at parse time, refused
+        // during the copy, so failure happens after the root is created.
+        let src = src_pkg(t.path(), "src", "cos72");
+        std::os::unix::fs::symlink(t.path().join("elsewhere"), src.join("leak")).unwrap();
+
+        let fresh = t.path().join("never-existed");
+        assert!(install(&src, &fresh).is_err());
+        assert!(
+            !fresh.exists(),
+            "the packages root was created by a failed install and left behind"
+        );
+
+        let preexisting = t.path().join("already-there");
+        std::fs::create_dir_all(&preexisting).unwrap();
+        assert!(install(&src, &preexisting).is_err());
+        assert!(
+            preexisting.exists(),
+            "cleanup deleted a packages root it did not create"
         );
     }
 
