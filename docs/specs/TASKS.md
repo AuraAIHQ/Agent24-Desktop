@@ -217,7 +217,7 @@ L0 KV（D1）、L1 会话压缩（D1+D5b）、三层路由（D2）全部 merged�
 >
 > **M-D 的状态源是 [SPEC-MD-ME.md](SPEC-MD-ME.md) §3 的那张表**,不是这里。符号含义(✅ 已被 daemon 端到端消费 / 🟡 部分接线 / 🟢 库原语在但未接线)与逐行状态都在那份文档里。**本节不复制状态** —— 复制正是这次漂移的根因。
 >
-> 本节保留只为存档旧计划的措辞,**不再更新**。旧表原文见 git 历史(本 commit 的 parent)。
+> 本节保留只为存档旧计划的措辞,**不再更新**。旧表原文见 PR#152 合并前的版本(其 parent 是 `dcdf62a`)—— squash 合并之后「本 commit 的 parent」对读文件的人无从解析,所以写成 sha。
 
 **收敛依据**：调研 9 个 top 仓库（mem0/letta/cognee/graphiti/basic-memory + codex/cline/aider/openhands + Claude Code），对源码逐条核实，报告在研究目录（未提交）。
 

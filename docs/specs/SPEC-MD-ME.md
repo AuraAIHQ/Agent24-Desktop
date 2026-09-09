@@ -24,6 +24,12 @@
 > | `.artifacts(` / `ArtifactStore` | 0 / 0 | MD-2 的另一半 |
 > | `.assertions(` / `AssertionStore`,`.retriever(` / `Retriever` | 0 / 0 | MD-3 |
 > | `.consolidator(` / `Consolidator` | 0 / 0 | MD-5 |
+>
+> **一个比任何 grep 都硬的锚点**（`rust/apps/agent24d/src/os_memory.rs:620` 的注释原文）：
+>
+> > *…nothing consumes these events for assertions or consolidation today, which is what keeps this a documented limitation rather than a live hole.*
+>
+> **daemon 自己的安全性论证就建立在「这些东西没被消费」上面。** 它比计数稳，因为它是维护者写下的、且**一旦接线就必须改**的句子——grep 计数会随重构漂移，这句不会。
 > | `.knowledge(` / `KnowledgeBase` | 0 / 0 | MD-7 |
 > | `.trace(` / `TaskTrace` | 0 / 0 | MD-8 |
 > | `.write_gate(` / `MemoryWriter` | 0 / 0 | MD-4 |
@@ -35,6 +41,15 @@
 >   printf "%-16s 全仓=" "$t"; rg -c "\b$t\b" rust/ | awk -F: '{s+=$2} END {print (s?s:0)}'
 > done
 > ```
+>
+> **正对照必须与判据同形状,否则它和被测共享同一个前提。** 本表上一版给 MD-6 配的正对照是裸词 `rg -c 'Embedder' rust/` —— 两个毛病:
+>
+> 1. 它**不经过判据里 `(struct|impl)\s+` 那一段**。那段要是写错了（少个 `\s+`、写成 `\s`），判据照样返回 0，而正对照照样绿 —— 它证明的是「这个词在这棵树里出现过」，不是「量具在工作」。
+> 2. `Embedder` 是 `OmlxEmbedder` 的子串，所以它命中的**正是判据要驳回的那两个文件**（`lib.rs`、`vector.rs`）。对照与被测同源，等于没对照。
+>
+> 换成 `(struct|impl)\s+VectorRetriever` → `vector.rs:97`，**同形状、同目录、同 crate**。而且那段正则确实承重：`vector.rs:103` 的 `impl<E: …> VectorRetriever<E>` **不**命中，因为 `impl` 后面是 `<` 不是空白。
+>
+> **同理，两段式判据要小心「只抄第一段」**：MD-5 曾用 `rg 'consolidat' rust/apps/agent24d/src | rg 'spawn|interval|loop'`，而**第一段单独跑是非 0 的**（2 处，都是注释）。照抄命令但漏掉第二段的人会读出相反的结论。已换成 `.consolidator(` 计数。
 >
 > **`.events(` 的 10 处就是正对照** —— 它证明这把量具看得见「已接线」长什么样,所以其余的 0 是真的 0,不是量具没工作。复跑:
 >
@@ -53,7 +68,7 @@
 > | MD-3 | AssertionStore + FTS Retriever | 两者 daemon 均未调用 |
 > | MD-4 | MemoryWriter 写门 | 写门本身未被 daemon 调用;另 bulk rollback + turn→candidate 抽取挂 MD-4b |
 > | MD-5 | Consolidator | **没有后台巩固循环**,只有调用方驱动的 `run_once`;默认 synth 只按事件数量生成文字 |
-> | MD-6 | Embedder 缝 + VectorRetriever | **`OmlxEmbedder` 不存在**(`(struct\|impl)\s+OmlxEmbedder` = 0;正对照 `Embedder` 命中 2 文件;**裸搜 `OmlxEmbedder` 命中 3 处全是注释** —— 只数命中会得出相反结论) |
+> | MD-6 | Embedder 缝 + VectorRetriever | **`OmlxEmbedder` 不存在**:`(struct\|impl)\s+OmlxEmbedder` = **0**;**同形状正对照** `(struct\|impl)\s+VectorRetriever` = **1**(`vector.rs:97`);裸搜 `OmlxEmbedder` 命中 3 处**全是注释** —— 只数命中会得出相反结论 |
 > | MD-7 | KnowledgeBase | daemon 未调用 |
 > | MD-8 | TaskTrace | daemon 未调用 |
 
