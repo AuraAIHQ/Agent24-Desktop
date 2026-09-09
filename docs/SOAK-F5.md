@@ -142,9 +142,20 @@ $A24_SPEAKER_BIN history inbox --as agent24 --limit 5 --json
 |---|---|
 | `wss://relay.aastar.io`（默认，iDoris 自己的） | **下线**。DNS 正常、TCP 443 通、WS 升级返回 **HTTP 530**（Cloudflare 源站不可达） |
 | `wss://relay.damus.io` | 第一次发成功，**接着连发三次全失败**（`503` + `publish: context deadline exceeded`）——限流 |
-| `ws://localhost:7447`（`bin/minirelay`） | 稳定。`sent=4 confirmed=3 lost=0 degraded_transitions=0` |
+| `ws://localhost:7447`（`bin/minirelay`） | ⚠️ **条件不明，与下文的 2% 不同源，不作为推荐依据** —— 见下 |
 
 canary 每 5 分钟一发、7 天两千次，打公共 relay 必然吃限流，于是 **`degraded` 会是 relay 的错而不是我们的错**，判据 6 被第三方可用性绑架。
+
+> **上表 minirelay 那行要单独说清楚，因为它和下文的 2% 在统计上不可能同源。** 那次读到的是 `sent=4 confirmed=3 lost=0`；若确认率真是 2%，4 次里 ≥3 次确认的概率是 **3.2×10⁻⁵**。所以那行背后有一个变量没被记下来。
+>
+> **取证做了，但没找到那个变量，如实写**：
+>
+> - **观测**：`messages.db` 里 11 条 `is_incoming=1` 的 canary，**9 条挤在 19:23–19:27 这 4 分钟**（间隔约 20 秒，正是探针 overdue 加速后的节奏，即那段时间**几乎每一条都确认了**），之后 40 分钟空白，再零星 2 条。不是随机分布，是**有条件的**。
+> - **`received_at − created_at`** 在那个窗口里是 0–25 秒，与「daemon 每 30 秒醒一次、订阅 3 秒」的节律相符。
+> - **一个被自己的数据证伪的假设**：我曾猜「经 daemon outbox 重发的 canary 会赢竞态（因为没有后续的 CLI 覆盖）」。对 event id 之后 —— daemon 日志里 12 条 `✅ Sent` 与**确认行、丢失行都零匹配**。**假设不成立，记下来免得下一个人再走一遍。**
+> - **仍未验证的假设**（PR-Daemon 提出，我没能证实也没能证伪）：真正的决定变量可能是**「daemon 那一刻有没有订阅同一条 relay」**，而不是「relay 在不在本地」。若真如此，选项表的三行全是**代理变量**，而那个真变量恰好是操作者能控制的 —— 它可能就是一个绕法（让 canary 走一条 daemon 不监听的 relay）。**在验证之前不要照这个思路配置泡测。**
+>
+> **所以 minirelay 那一行不作为任何推荐的依据。** 下面 2% 那组读数是在同一套配置上连续跑 40 分钟得到的，条件明确，以它为准。
 
 ### ⛔ 但**别用本地 minirelay** —— 它会把一个上游竞态从偶发变成必然（2026-09-09 实测推翻了本节的上一版结论）
 
