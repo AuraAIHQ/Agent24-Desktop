@@ -1178,11 +1178,24 @@ impl_kind: in_process_crate
     }
 
     #[test]
-    fn nothing_reads_a_future_documents_fields_before_refusing_its_version() {
-        // A build announcing "I cannot read v7" must not, in the same breath, have
-        // read a field OUT of that v7 document. Doing so assumes v7 still spells the
-        // field this way and still types it this way — the exact assumption §3 says
-        // `<= current` cannot survive.
+    fn no_field_of_a_future_document_decides_the_outcome() {
+        // The line is not "did it READ anything", it is "did anything it read
+        // DECIDE anything". An earlier name for this test said "nothing reads a
+        // future document's fields", which was stronger than the code: `module` is
+        // read from that document's `name` and appears in the very error below
+        // (`module: "sin90"`).
+        //
+        // That read is deliberate and harmless because `name` decides nothing — it
+        // never participates in a judgement, and when it is missing or the wrong
+        // type it degrades to `<unnamed>`. The worst it can produce is a MISLEADING
+        // LABEL. The protocol gate was different in kind: it produced an ASSERTION
+        // ABOUT THE DOCUMENT ("your field is the wrong type") from a document whose
+        // schema this build had just declared it cannot read.
+        //
+        // So: a build announcing "I cannot read v7" must not let anything it finds
+        // in that v7 document determine what happens. Doing so assumes v7 still
+        // spells the field this way and still types it this way — the exact
+        // assumption §3 says `<= current` cannot survive.
         //
         // The visible symptom was narrower and easier to dismiss: a future manifest
         // with a malformed `min_daemon_protocol` was told its FIELD was the wrong
