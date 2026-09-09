@@ -289,24 +289,30 @@ mod tests {
     /// It matters here more than its size suggests: this slice is the one that
     /// sets the pattern for the four after it. A precedent that "a constant is
     /// not an answer" is how 3b-1's `-32700` and 3b-2b's `-32600` /
-    /// `auth_failed` / `manifest_mismatch` would arrive unguarded too.
+    /// `auth_failed` / `manifest_mismatch` would arrive unguarded too — and it is
+    /// why the assertion is a whole-word one. A half-open form copied four times
+    /// is worse than no form at all: every copy carries a name saying it was
+    /// checked.
     #[test]
     fn the_wire_kind_is_the_one_the_spec_names() {
         // SPEC-ME3 §8 (ME-3b row), verbatim — the same sentence quoted beside the
         // empty-intersection cases above:
         const SPEC: &str =
             "交集为空 → 握手失败并把两边区间都放进错误（`-32000` + `version_mismatch`）";
+        // WHOLE WORD, not substring. The SPEC writes the kind inside backticks,
+        // and those backticks are what supply the word boundary — without them
+        // the assertion passes for any TRUNCATION of the real string. Not a
+        // contrived worry: `KIND = "version"` is the most likely wrong value this
+        // could ever hold, and the first version of this test let it through. It
+        // excluded one specific misspelling, which is not the same as requiring
+        // the right answer. Measured on that version: `"version"` and
+        // `"mismatch"` each turned the workspace red 0 times, while the
+        // misspelling turned it red once — so the test was real, and half open.
+        let word = format!("`{}`", VersionMismatch::KIND);
         assert!(
-            SPEC.contains(VersionMismatch::KIND),
-            "KIND is {:?}, which does not appear in the SPEC sentence that names it",
+            SPEC.contains(&word),
+            "KIND is {:?}, which does not appear as a whole word in the SPEC sentence that names it",
             VersionMismatch::KIND
-        );
-        // Control: the assertion above must be able to fail. A `contains` against
-        // a long sentence passes for any short substring of it, so this pins that
-        // the check is not satisfied by an accident of the prose.
-        assert!(
-            !SPEC.contains("verison_mistmatch"),
-            "the control string was accidentally made to appear in the quotation"
         );
     }
 
