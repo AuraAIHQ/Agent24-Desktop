@@ -128,8 +128,19 @@ pub type Result<T> = std::result::Result<T, DomainError>;
 /// A kernel capability a domain OS may request in its manifest. The kernel
 /// grants a SUBSET; a capability that was not granted must be unreachable — see
 /// [`KernelCtx`], where an ungranted capability has no handle at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// `non_exhaustive` because this list grows: `Approval` lands with ME-3e, and
+/// `Models` / `Scheduler` / `Policy` become real when their handles do. Without
+/// it, every added variant breaks an exhaustive `match` in any crate outside this
+/// one — a source-compatibility break shipped silently, because nothing in this
+/// repository matches exhaustively and CI therefore cannot see it.
+///
+/// It does NOT derive `Deserialize`. Reading a manifest with a strict enum turns
+/// an unrecognised capability into a serde message about a variant, which cannot
+/// carry the name of the offending capability in a form a caller can act on. See
+/// [`Capability::parse`] and `RawManifest`'s `kernel_capabilities`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Capability {
     /// Emit `EventBody::Module` events under the module's OWN name.
     Events,
@@ -144,7 +155,57 @@ pub enum Capability {
     Memory,
 }
 
+/// Every capability this build knows, in declaration order. The single place the
+/// list is written down, so `parse` and the `supported` list in an error cannot
+/// drift apart.
+pub const ALL_CAPABILITIES: &[Capability] = &[
+    Capability::Events,
+    Capability::Models,
+    Capability::Scheduler,
+    Capability::Policy,
+    Capability::Memory,
+];
+
+/// A capability string a manifest asked for that this build does not know.
+///
+/// A struct rather than a message, because the operator's next question is always
+/// "which one, and what were the choices?" — and a serde variant error can answer
+/// neither in a form a caller can read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCapability {
+    /// Exactly what the manifest said, unmodified. A typo is only findable if the
+    /// error shows the typo.
+    pub capability: String,
+    pub supported: Vec<&'static str>,
+}
+
+impl std::fmt::Display for UnknownCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown_capability: {:?} is not one of {}",
+            self.capability,
+            self.supported.join(", ")
+        )
+    }
+}
+
 impl Capability {
+    /// Map a manifest string onto a capability, naming what was wrong if it is not
+    /// one. Deliberately not `Deserialize`: serde's variant error says which
+    /// variants exist but not which STRING was rejected in a shape a caller can
+    /// use, and a manifest full of capabilities gives no clue which one it meant.
+    pub fn parse(s: &str) -> std::result::Result<Self, UnknownCapability> {
+        ALL_CAPABILITIES
+            .iter()
+            .copied()
+            .find(|c| c.as_str() == s)
+            .ok_or_else(|| UnknownCapability {
+                capability: s.to_owned(),
+                supported: ALL_CAPABILITIES.iter().map(|c| c.as_str()).collect(),
+            })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Capability::Events => "events",
@@ -197,8 +258,12 @@ struct RawManifest {
     requires_apis: Vec<String>,
     #[serde(default)]
     requires_deps: Vec<String>,
+    /// Collected as STRINGS and mapped afterwards. Deserializing straight into
+    /// `Vec<Capability>` makes an unrecognised entry a serde variant error, which
+    /// cannot be turned into [`UnknownCapability`] — the string it rejected is not
+    /// recoverable from the message.
     #[serde(default)]
-    kernel_capabilities: Vec<Capability>,
+    kernel_capabilities: Vec<String>,
     #[serde(default)]
     ui_entry: Option<String>,
     impl_kind: ImplKind,
@@ -381,23 +446,14 @@ impl DomainOsManifest {
             .unwrap_or("<unnamed>")
             .to_owned();
 
+        // This read must stay ahead of the dispatch — the dispatch needs the value.
+        // A judgement call rides on that: `manifest_version: 1.0` is a YAML float,
+        // and it is refused as "must be a non-negative integer" even though this
+        // build supports v1. That is deliberate. The daemon does support v1; what it
+        // cannot accept is a version field that is not an integer, and saying so
+        // names the actual defect and the fix. Calling it `ManifestUnsupported`
+        // would claim the version is unsupported, which is false.
         let declared_schema = field_u32("manifest_version")?.unwrap_or(1);
-        if declared_schema > u64::from(MANIFEST_SCHEMA_VERSION) {
-            return Err(DomainError::ManifestUnsupported {
-                module,
-                requirement: format!("manifest schema v{declared_schema}"),
-                supported: format!("v{MANIFEST_SCHEMA_VERSION}"),
-            });
-        }
-        if let Some(min) = field_u32("min_daemon_protocol")?
-            && min > u64::from(DAEMON_PROTOCOL_VERSION)
-        {
-            return Err(DomainError::ManifestUnsupported {
-                module,
-                requirement: format!("kernel protocol >= {min}"),
-                supported: format!("<= {DAEMON_PROTOCOL_VERSION}"),
-            });
-        }
 
         // Collected BEFORE the tree is consumed below. Cheap: one pass over the
         // top-level map. Used only on the error path (see there for why).
@@ -410,6 +466,64 @@ impl DomainOsManifest {
                     .collect()
             })
             .unwrap_or_default();
+
+        // Versions are dispatched EXPLICITLY, not by `<= current`.
+        //
+        // A `> MANIFEST_SCHEMA_VERSION` gate used to sit above this and answer
+        // FIRST, so the future-manifest case — the entire reason this match exists
+        // — was still being decided by `<= current`, and the match only ever saw
+        // `0`. Nothing could tell: deleting that gate broke no test, because the
+        // one test for a future manifest ignored `supported` with `..`, and that is
+        // the only field where the two answers differed ("v1" vs "v1..=v1"). The
+        // gate is gone and that assertion is now made.
+        //
+        // This is also what refuses `0`: versions start at 1, so `0` is not "older than v1" — there
+        // is no v1-minus, and a document declaring it means something this build
+        // cannot know. A dedicated `== 0` check was written here first and then
+        // removed: the match already rejected it, with a byte-identical message, so
+        // the check could not fail in any way the match did not. (A mutation found
+        // it — disabling the dedicated check killed no test, because the match was
+        // catching the case all along.) Today v1 is the
+        // only one, so the match has a single arm — but writing it as a match is
+        // the point: when v2 arrives it gets its own arm and its own struct, rather
+        // than v1 documents being quietly fed to whatever `RawManifest` has become.
+        // A shape that says "anything not newer than me is mine" cannot survive a
+        // field being renamed or retyped.
+        match declared_schema {
+            1 => {}
+            other => {
+                return Err(DomainError::ManifestUnsupported {
+                    module,
+                    requirement: format!("manifest schema v{other}"),
+                    supported: format!("v1..=v{MANIFEST_SCHEMA_VERSION}"),
+                });
+            }
+        }
+
+        // The protocol gate reads `min_daemon_protocol` — a field of THIS document
+        // — so it can only run once the version dispatch above has accepted the
+        // document's schema. It used to run BEFORE the dispatch, which had two
+        // consequences, and the second is the one that matters:
+        //
+        //  - A future manifest with a malformed `min_daemon_protocol` was told its
+        //    field was the wrong type, i.e. that it was a malformed document —
+        //    contradicting `ManifestUnsupported`'s own documentation, which says a
+        //    future manifest hitting an old daemon is NOT malformed.
+        //  - More fundamentally: reading that field out of a v7 document assumes v7
+        //    still spells it this way and still types it this way. This build was in
+        //    the middle of announcing that it cannot read v7. That is precisely the
+        //    reason §3 gives for why `<= current` cannot survive a field being
+        //    renamed or retyped — except it was not in the `<= current`, it was
+        //    three lines above it.
+        if let Some(min) = field_u32("min_daemon_protocol")?
+            && min > u64::from(DAEMON_PROTOCOL_VERSION)
+        {
+            return Err(DomainError::ManifestUnsupported {
+                module,
+                requirement: format!("kernel protocol >= {min}"),
+                supported: format!("<= {DAEMON_PROTOCOL_VERSION}"),
+            });
+        }
 
         // ---- step two: the STRICT shape, now that the version is known-good ----
         let raw: RawManifest = serde_yaml::from_value(tree).map_err(|e| {
@@ -500,13 +614,23 @@ impl DomainOsManifest {
             )));
         }
 
+        // Mapped here rather than during deserialization, so an unrecognised entry
+        // can say WHICH string it was and what the choices are. `deny_unknown_fields`
+        // catches a misspelled FIELD; this catches a misspelled VALUE, and until now
+        // the second produced a serde variant error naming every valid option except
+        // the one the author actually typed.
+        let mut caps = Vec::with_capacity(raw.kernel_capabilities.len());
+        for c in &raw.kernel_capabilities {
+            caps.push(Capability::parse(c).map_err(|e| DomainError::Manifest(e.to_string()))?);
+        }
+
         Ok(Self {
             name: raw.name,
             version: raw.version,
             requires_models: raw.requires_models,
             requires_apis: raw.requires_apis,
             requires_deps: raw.requires_deps,
-            kernel_capabilities: raw.kernel_capabilities,
+            kernel_capabilities: caps,
             ui_entry: raw.ui_entry,
             impl_kind: raw.impl_kind,
         })
@@ -917,6 +1041,100 @@ impl_kind: in_process_crate
     }
 
     #[test]
+    fn an_unknown_capability_names_itself_and_the_alternatives() {
+        // A misspelled capability used to produce serde's variant error, which
+        // lists every valid option EXCEPT the one the author typed — so the reader
+        // has to diff the list against their own file to find it. The error must
+        // carry the rejected string.
+        let yaml = SIN90_YAML.replace(
+            "kernel_capabilities: [events]",
+            "kernel_capabilities: [events, telepthy]",
+        );
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("telepthy"),
+            "the error must show the string that was rejected, or a typo is a \
+             scavenger hunt: {err}"
+        );
+        assert!(err.contains("unknown_capability"), "{err}");
+        // And the alternatives, or "it is not one of them" is unactionable.
+        assert!(err.contains("events") && err.contains("memory"), "{err}");
+    }
+
+    #[test]
+    fn the_capability_list_and_the_parser_cannot_drift() {
+        // `ALL_CAPABILITIES` feeds both `parse` and the `supported` list in the
+        // error. If a variant is added to the enum but not to the slice, it becomes
+        // unparseable while still being a legal value elsewhere — a split that
+        // produces "unknown_capability: memory" if it ever happened to `Memory`.
+        // The list must be built from the ENUM, not read off the slice. Iterating
+        // `ALL_CAPABILITIES` only catches drift one way (a name in the slice that
+        // `parse` rejects); the direction this test's own comment names — a variant
+        // ADDED to the enum but not to the slice — is invisible to it, because the
+        // loop never sees that variant. Measured: adding a variant to the enum and
+        // to `as_str`, leaving the slice alone, kept every test green.
+        //
+        // The exhaustive `match` is the mechanism. `non_exhaustive` does not apply
+        // inside the defining crate, so a new variant makes this fail to COMPILE
+        // until it is listed here — and listing it here is what puts it in front of
+        // the assertion below.
+        let every_variant: Vec<Capability> = [
+            Capability::Events,
+            Capability::Models,
+            Capability::Scheduler,
+            Capability::Policy,
+            Capability::Memory,
+        ]
+        .into_iter()
+        .inspect(|c| {
+            // Forces the compiler to check this list is complete: adding a variant
+            // without adding it above breaks this match.
+            match c {
+                Capability::Events
+                | Capability::Models
+                | Capability::Scheduler
+                | Capability::Policy
+                | Capability::Memory => {}
+            }
+        })
+        .collect();
+
+        for c in &every_variant {
+            assert!(
+                ALL_CAPABILITIES.contains(c),
+                "{} is a variant but missing from ALL_CAPABILITIES — `parse` would \
+                 reject a legal capability while `as_str` still produces it",
+                c.as_str()
+            );
+            assert_eq!(
+                Capability::parse(c.as_str()).unwrap(),
+                *c,
+                "{} round-trips through its own string",
+                c.as_str()
+            );
+        }
+        // Control: the parser is not simply accepting everything.
+        assert!(Capability::parse("definitely-not-a-capability").is_err());
+    }
+
+    #[test]
+    fn schema_version_zero_is_refused() {
+        // Versions start at 1, so `0` is not "older than v1" — there is no v1-minus.
+        // Accepting it would treat a document whose author meant something else as
+        // if it were unversioned.
+        let yaml = format!("{SIN90_YAML}manifest_version: 0\n");
+        let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+        assert!(
+            matches!(err, DomainError::ManifestUnsupported { .. }),
+            "v0 is a version mismatch, not a malformed document: {err:?}"
+        );
+        // Control: v1 and absent both still load, so this did not just break the
+        // compatibility rule it sits beside.
+        assert!(DomainOsManifest::from_yaml(SIN90_YAML).is_ok());
+        assert!(DomainOsManifest::from_yaml(&format!("{SIN90_YAML}manifest_version: 1\n")).is_ok());
+    }
+
+    #[test]
     fn manifest_from_the_future_names_the_version_not_a_stray_field() {
         // The future manifest also carries a field this build has never heard of.
         // That is the whole point: the STRICT shape would fail on `warp_drive`
@@ -930,12 +1148,23 @@ impl_kind: in_process_crate
             DomainError::ManifestUnsupported {
                 module,
                 requirement,
-                ..
+                supported,
             } => {
                 assert_eq!(module, "sin90", "the operator needs to know WHICH module");
                 assert!(
                     requirement.contains(&(MANIFEST_SCHEMA_VERSION + 1).to_string()),
                     "requirement must name the version it wanted: {requirement}"
+                );
+                // Assert `supported` too, and assert its SHAPE — a range, not a
+                // bare number. Ignoring this field with `..` is exactly what let a
+                // redundant second gate answer this case: the two paths produced
+                // different `supported` strings ("v1" vs "v1..=v1") and no test
+                // looked at the field where they differed.
+                assert_eq!(
+                    supported,
+                    &format!("v1..=v{MANIFEST_SCHEMA_VERSION}"),
+                    "the supported RANGE must be shown, and it must come from the \
+                     version dispatch — a bare number means something else answered"
                 );
             }
             other => panic!("expected ManifestUnsupported, got {other:?}"),
@@ -945,6 +1174,60 @@ impl_kind: in_process_crate
             !msg.contains("warp_drive"),
             "the message must not blame the unknown field — that is the failure \
              mode gate 6 exists to prevent: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_field_of_a_future_document_decides_the_outcome() {
+        // The line is not "did it READ anything", it is "did anything it read
+        // DECIDE anything". An earlier name for this test said "nothing reads a
+        // future document's fields", which was stronger than the code: `module` is
+        // read from that document's `name` and appears in the very error below
+        // (`module: "sin90"`).
+        //
+        // That read is deliberate and harmless because `name` decides nothing — it
+        // never participates in a judgement, and when it is missing or the wrong
+        // type it degrades to `<unnamed>`. The worst it can produce is a MISLEADING
+        // LABEL. The protocol gate was different in kind: it produced an ASSERTION
+        // ABOUT THE DOCUMENT ("your field is the wrong type") from a document whose
+        // schema this build had just declared it cannot read.
+        //
+        // So: a build announcing "I cannot read v7" must not let anything it finds
+        // in that v7 document determine what happens. Doing so assumes v7 still
+        // spells the field this way and still types it this way — the exact
+        // assumption §3 says `<= current` cannot survive.
+        //
+        // The visible symptom was narrower and easier to dismiss: a future manifest
+        // with a malformed `min_daemon_protocol` was told its FIELD was the wrong
+        // type, i.e. that the document was malformed — contradicting
+        // `ManifestUnsupported`'s own documentation.
+        let future = format!(
+            "{SIN90_YAML}manifest_version: {}\n",
+            MANIFEST_SCHEMA_VERSION + 1
+        );
+        for tail in ["min_daemon_protocol: 99\n", "min_daemon_protocol: nope\n"] {
+            let err = DomainOsManifest::from_yaml(&format!("{future}{tail}")).unwrap_err();
+            match &err {
+                DomainError::ManifestUnsupported { requirement, .. } => assert!(
+                    requirement.contains("manifest schema"),
+                    "the VERSION must be what is refused, not something read out of \
+                     a document whose version we just rejected: {requirement}"
+                ),
+                other => panic!("expected a version refusal, got {other:?}"),
+            }
+        }
+
+        // Control: at a version we DO support, the protocol gate must still fire.
+        // Without this, "the version answers first" is equally satisfied by having
+        // deleted the protocol gate altogether.
+        let err = DomainOsManifest::from_yaml(&format!(
+            "{SIN90_YAML}min_daemon_protocol: {}\n",
+            DAEMON_PROTOCOL_VERSION + 1
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("kernel protocol"),
+            "the protocol gate must still work at a supported version: {err}"
         );
     }
 
