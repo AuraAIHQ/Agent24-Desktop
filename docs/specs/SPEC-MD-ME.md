@@ -28,6 +28,14 @@
 > | `.trace(` / `TaskTrace` | 0 / 0 | MD-8 |
 > | `.write_gate(` / `MemoryWriter` | 0 / 0 | MD-4 |
 >
+> **第二列还需要一格这张表自己没做的检查**（PR-Daemon 在 #152 补的）：**如果那个 trait 名根本不存在，它的 0 就与「量具没工作」分不开** —— 这正是 `OmlxEmbedder` 那条警告的坑，只是换到了列上。所以先验存在性：`EventLog` / `ArtifactStore` / `AssertionStore` / `Retriever` / `Consolidator` / `KnowledgeBase` / `TaskTrace` / `MemoryWriter` **每个在 `rust/` 里都有定义，全仓命中 2–31**。因此第二列的 0 是真的「`apps` 没用到」，不是名字打错了。复跑：
+>
+> ```bash
+> for t in EventLog ArtifactStore AssertionStore Retriever Consolidator KnowledgeBase TaskTrace MemoryWriter; do
+>   printf "%-16s 全仓=" "$t"; rg -c "\b$t\b" rust/ | awk -F: '{s+=$2} END {print (s?s:0)}'
+> done
+> ```
+>
 > **`.events(` 的 10 处就是正对照** —— 它证明这把量具看得见「已接线」长什么样,所以其余的 0 是真的 0,不是量具没工作。复跑:
 >
 > ```bash
