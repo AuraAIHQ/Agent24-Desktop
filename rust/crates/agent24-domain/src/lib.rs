@@ -357,7 +357,16 @@ impl DomainOsManifest {
         // the field. That is exactly the unreadable outcome gate 6 removes.
         let field_u32 = |k: &str| -> Result<Option<u64>> {
             match tree.get(k) {
-                None | Some(serde_yaml::Value::Null) => Ok(None),
+                // ABSENT only. `key:` with no value is PRESENT-but-empty, and it
+                // falls through to the error arm below — the last place this
+                // gate's own principle was still collapsing. Nobody writes an
+                // empty value to mean "v1": omitting the key already means that
+                // and is shorter, so in practice an empty value is a slip or a
+                // template's unfilled slot, and both want to be told now. (If a
+                // generator ever emits `key:` to mean "filled in later", that
+                // belongs on the generating side — the kernel must not read it
+                // as 1.)
+                None => Ok(None),
                 Some(v) => v.as_u64().map(Some).ok_or_else(|| {
                     DomainError::Manifest(format!("{k} must be a non-negative integer, got {v:?}"))
                 }),
@@ -425,7 +434,15 @@ impl DomainOsManifest {
                     .err()
                     .map(|located| located.to_string())
             {
-                return DomainError::Manifest(located);
+                // Both facts are true and they do not compete: the borrowed
+                // message locates the FIRST thing serde tripped on, while a null
+                // field further up may be the reason the author is here at all.
+                // Reporting only the borrowed one sends them round a second lap.
+                return DomainError::Manifest(if null_keys.is_empty() {
+                    located
+                } else {
+                    format!("{located} — null-valued field(s): {}", null_keys.join(", "))
+                });
             }
             // Nothing to borrow. This is not the rare case — it is exactly the
             // case that needs help most, because `from_str` only has a message to
@@ -1060,6 +1077,54 @@ impl_kind: in_process_crate
             err.to_string().contains("invalid type"),
             "a YAML null must be refused ON TYPE, never coerced to the string \
              \"~\" and waved through: {err}"
+        );
+    }
+
+    #[test]
+    fn a_version_key_with_no_value_is_not_silently_v1() {
+        // PRESENT-but-empty is not ABSENT. This was the last place where the
+        // gate's own principle — keep those two apart — was still collapsing.
+        // Nobody writes `manifest_version:` to mean v1: omitting the key already
+        // means that and is shorter. So an empty value is a slip or an unfilled
+        // template slot, and both want to be told now rather than to be read as 1.
+        for key in ["manifest_version", "min_daemon_protocol"] {
+            let yaml = format!("{SIN90_YAML}{key}:\n");
+            let err = DomainOsManifest::from_yaml(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains(key),
+                "an empty {key} must be refused BY NAME, not read as absent: {err}"
+            );
+        }
+        // Control: the absent case must still load, or this check has simply
+        // broken the compatibility rule it sits next to.
+        assert!(DomainOsManifest::from_yaml(SIN90_YAML).is_ok());
+    }
+
+    #[test]
+    fn a_located_message_also_carries_the_null_fields() {
+        // Both facts are true and they do not compete. The borrowed message
+        // locates the FIRST thing serde tripped on; a null field further up may be
+        // the reason the author is here at all. Reporting only the borrowed one
+        // sends them round a second lap — fix the stray field, run again, and only
+        // then meet the real culprit.
+        let yaml = format!(
+            "{}\nwarp_drive: true\n",
+            SIN90_YAML.replace(r#"version: "0.2.1""#, "version: ~")
+        );
+        let msg = DomainOsManifest::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(
+            msg.contains("warp_drive"),
+            "the located message must survive: {msg}"
+        );
+        // Assert the MARKER, not the word "version". serde's own message lists the
+        // expected field names — `version` among them — so `contains("version")`
+        // is satisfied whether or not the null list was appended. (It was written
+        // that way; mutation 10 killed nothing, which is how it was found. Fourth
+        // time in this change: the assertion landed on a set wider than the
+        // property it claimed to test.)
+        assert!(
+            msg.contains("null-valued field(s): version"),
+            "the null field must ride along, or the author needs two laps: {msg}"
         );
     }
 
