@@ -10,6 +10,8 @@ description = "Agent24 kernel↔domain-OS protocol (ME-3b): version negotiation,
 agent24-domain = { path = "../agent24-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# For signalling a process GROUP — a safe wrapper over `killpg`.
+rustix = { version = "0.38", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"
