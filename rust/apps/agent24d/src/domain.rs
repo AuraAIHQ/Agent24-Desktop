@@ -886,10 +886,18 @@ mod tests {
     }
 
     fn manifest_yaml(name: &str, kind: &str) -> String {
+        // ME-3b-3: an out-of-process module must declare how to start it, and an
+        // in-process one must not. Both halves are refused at parse time, so the
+        // fixture cannot simply always include a spawn block.
+        let spawn = if kind == "out_of_process_provider" {
+            "spawn:\n  command: bin/mod\n"
+        } else {
+            ""
+        };
         format!(
             "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
              event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
-             kernel_capabilities: [events]\nimpl_kind: {kind}\n"
+             kernel_capabilities: [events]\nimpl_kind: {kind}\n{spawn}"
         )
     }
 

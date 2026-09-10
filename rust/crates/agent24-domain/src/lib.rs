@@ -229,6 +229,84 @@ pub enum ImplKind {
     OutOfProcessProvider,
 }
 
+/// How to start an out-of-process module.
+///
+/// # Why `command` + `args`, and not one string or one path
+///
+/// The alternative — a single executable path — forces every module NOT written
+/// in a compiled language to ship a wrapper script (`#!/bin/sh` + `exec node
+/// server.js`). That does not remove the indirection, it moves it somewhere
+/// harder to review: the kernel then reads a manifest that names a shell script
+/// whose contents nobody validated, instead of a manifest that says `node
+/// server.js` in the open. **Making "which language is this written in" into
+/// something authors have to work around produces workarounds that are worse
+/// than the field.**
+///
+/// # This field is an execution boundary
+///
+/// Whoever can write a manifest can name a program the daemon will run. Nothing
+/// here changes that — it is inherent to spawning a module at all. What follows
+/// from it is a requirement OUTSIDE this type: the packages root must be a
+/// directory only the user can write (see FU-41). A validation rule here cannot
+/// substitute for that, and pretending otherwise would be the more dangerous
+/// error, because the rule would carry a name saying it was checked.
+///
+/// What validation here DOES do is narrow what a manifest can point at: see
+/// [`SpawnCommand::validate`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnCommand {
+    /// The program. Either a **bare name** resolved on `PATH` (`node`,
+    /// `python3`), or a path **relative to the package directory**
+    /// (`bin/my-module`). Absolute paths and any `..` component are refused —
+    /// see [`SpawnCommand::validate`].
+    pub command: String,
+    /// Arguments, passed verbatim. Never shell-interpreted: the kernel executes the
+    /// program directly, so quoting, globbing and `;` have no meaning here.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl SpawnCommand {
+    /// What a manifest may point at.
+    ///
+    /// Refused: an empty command; an **absolute path**; any component that is
+    /// `..`. Allowed: a bare name (resolved on `PATH`) or a relative path inside
+    /// the package.
+    ///
+    /// The rule is not a security boundary — see the type's docs — it is about
+    /// what a package can DESCRIBE. A package that names `/bin/sh` or
+    /// `../../elsewhere` is describing something outside itself, and a package
+    /// that is not self-describing cannot be reviewed by reading it.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the offending value.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.command.trim().is_empty() {
+            return Err("spawn.command is empty".to_owned());
+        }
+        let path = Path::new(&self.command);
+        if path.is_absolute() {
+            return Err(format!(
+                "spawn.command {:?} is an absolute path; use a bare name (resolved \
+                 on PATH) or a path relative to the package",
+                self.command
+            ));
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "spawn.command {:?} escapes the package with `..`",
+                self.command
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The `domain-os.yml` SCHEMA version this build understands.
 ///
 /// A manifest that omits `manifest_version` is treated as **v1** — every manifest
@@ -267,6 +345,8 @@ struct RawManifest {
     #[serde(default)]
     ui_entry: Option<String>,
     impl_kind: ImplKind,
+    #[serde(default)]
+    spawn: Option<SpawnCommand>,
     /// Declared here ONLY so `deny_unknown_fields` does not reject the very
     /// fields step one just read. Their values are consumed by
     /// [`ManifestEnvelope`]; re-reading them here would be reading the same
@@ -309,6 +389,7 @@ pub struct DomainOsManifest {
     kernel_capabilities: Vec<Capability>,
     ui_entry: Option<String>,
     impl_kind: ImplKind,
+    spawn: Option<SpawnCommand>,
 }
 
 /// Names that are not usable as a directory on Windows regardless of extension.
@@ -624,6 +705,39 @@ impl DomainOsManifest {
             caps.push(Capability::parse(c).map_err(|e| DomainError::Manifest(e.to_string()))?);
         }
 
+        // `spawn` and `impl_kind` must agree, in BOTH directions.
+        //
+        // Missing when out-of-process: the kernel would have a module it cannot
+        // start, and would find that out at spawn time rather than at parse time
+        // — after the package is installed and the operator has been told it
+        // worked.
+        //
+        // Present when in-process: a contradiction, and the dangerous half is
+        // that it is a SILENT one. A crate compiled into the daemon ignores the
+        // field, so a manifest saying `impl_kind: in_process_crate` with a spawn
+        // command describes a program that will never run, while reading as
+        // though it does.
+        match (raw.impl_kind, raw.spawn.as_ref()) {
+            (ImplKind::OutOfProcessProvider, None) => {
+                return Err(DomainError::Manifest(
+                    "impl_kind is out_of_process but no `spawn` command is declared; \
+                     the kernel would have no way to start this module"
+                        .to_owned(),
+                ));
+            }
+            (ImplKind::InProcessCrate, Some(_)) => {
+                return Err(DomainError::Manifest(
+                    "`spawn` is declared but impl_kind is in_process_crate; a compiled-in \
+                     module is never started as a process, so this command would never run"
+                        .to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(spawn) = raw.spawn.as_ref() {
+            spawn.validate().map_err(DomainError::Manifest)?;
+        }
+
         Ok(Self {
             name: raw.name,
             version: raw.version,
@@ -633,6 +747,7 @@ impl DomainOsManifest {
             kernel_capabilities: caps,
             ui_entry: raw.ui_entry,
             impl_kind: raw.impl_kind,
+            spawn: raw.spawn,
         })
     }
 
@@ -702,6 +817,16 @@ impl DomainOsManifest {
     /// `OutOfProcessProvider` manifest parses fine (the shape is part of the
     /// contract) but ME-3's transport does not exist yet, so the in-process
     /// mounter MUST refuse it rather than half-mount a config it cannot honor.
+    /// How to start this module, when it is an out-of-process one.
+    ///
+    /// `None` for an in-process crate — and that is not "not configured yet",
+    /// it is a state the parser refuses to produce for an out-of-process module.
+    /// A caller therefore never has to decide what a missing command means.
+    #[must_use]
+    pub fn spawn(&self) -> Option<&SpawnCommand> {
+        self.spawn.as_ref()
+    }
+
     pub fn is_mountable_in_process(&self) -> bool {
         matches!(self.impl_kind, ImplKind::InProcessCrate)
     }
@@ -1590,9 +1715,13 @@ impl_kind: in_process_crate
 
     #[test]
     fn out_of_process_manifest_parses_but_is_not_in_process_mountable() {
+        // The fixture gained a `spawn` block when ME-3b-3 made one mandatory for
+        // out-of-process modules. Without it this manifest is now refused at
+        // PARSE time — which is the point of that rule — so the old fixture was
+        // describing a manifest that can no longer exist.
         let yaml = SIN90_YAML.replace(
             "impl_kind: in_process_crate",
-            "impl_kind: out_of_process_provider",
+            "impl_kind: out_of_process_provider\nspawn:\n  command: bin/sin90\n",
         );
         let m = DomainOsManifest::from_yaml(&yaml).unwrap();
         assert!(!m.is_mountable_in_process());
@@ -1754,5 +1883,126 @@ impl_kind: in_process_crate
             EventBody::Module(m) => assert!(m.payload.is_empty()),
             other => panic!("expected Module, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn manifest(impl_kind: &str, spawn: &str) -> Result<DomainOsManifest> {
+        DomainOsManifest::from_yaml(&format!(
+            "name: cos72\n\
+             version: \"0.1.0\"\n\
+             route_namespace: /api/v1/cos72\n\
+             event_module: cos72\n\
+             data_dir: ~/.agent24/os/cos72/\n\
+             impl_kind: {impl_kind}\n{spawn}"
+        ))
+    }
+
+    /// The field exists at all — which it did not until ME-3b-3, even though
+    /// SPEC's ME-3a row said the manifest supports a spawn command. The half was
+    /// simply never implemented, and nothing noticed because no code had reached
+    /// the point of needing to start anything.
+    #[test]
+    fn an_out_of_process_module_declares_how_to_start_it() {
+        let m = manifest(
+            "out_of_process_provider",
+            "spawn:\n  command: node\n  args: [\"server.js\"]\n",
+        )
+        .expect("a well-formed out-of-process manifest");
+        let spawn = m.spawn().expect("out-of-process implies a spawn command");
+        assert_eq!(spawn.command, "node");
+        assert_eq!(spawn.args, ["server.js"]);
+    }
+
+    /// The point of `command` + `args`: a module written in any language is
+    /// declared directly, rather than behind a wrapper script the kernel would
+    /// read without anyone reviewing it.
+    #[test]
+    fn a_module_in_any_language_can_be_declared_without_a_wrapper() {
+        for (command, args) in [
+            ("node", "[\"server.js\"]"),
+            ("python3", "[\"-u\", \"main.py\"]"),
+            ("bin/my-module", "[]"),
+        ] {
+            let m = manifest(
+                "out_of_process_provider",
+                &format!("spawn:\n  command: {command}\n  args: {args}\n"),
+            )
+            .unwrap_or_else(|e| panic!("{command} was refused: {e}"));
+            assert_eq!(m.spawn().unwrap().command, command);
+        }
+    }
+
+    /// Both directions of the agreement between `impl_kind` and `spawn`.
+    ///
+    /// The in-process half is the one worth having: a compiled-in crate ignores
+    /// the field, so without this check the manifest would describe a program
+    /// that never runs while reading as though it does — a silent contradiction
+    /// rather than a loud one.
+    #[test]
+    fn impl_kind_and_spawn_must_agree_in_both_directions() {
+        let missing = manifest("out_of_process_provider", "").expect_err("no spawn command");
+        assert!(missing.to_string().contains("spawn"), "{missing}");
+
+        let contradiction = manifest("in_process_crate", "spawn:\n  command: node\n")
+            .expect_err("in-process module with a spawn command");
+        assert!(
+            contradiction.to_string().contains("spawn"),
+            "{contradiction}"
+        );
+
+        // Controls: each kind on its own is fine, so the two refusals above are
+        // about the COMBINATION and not about either half.
+        assert!(manifest("in_process_crate", "").is_ok());
+        assert!(manifest("out_of_process_provider", "spawn:\n  command: node\n").is_ok());
+    }
+
+    /// A package that names something outside itself cannot be reviewed by
+    /// reading it.
+    ///
+    /// Note what this is NOT: it is not a security boundary. Whoever can write
+    /// the manifest can already name `node` and put anything on `PATH`. The
+    /// boundary is who may write the packages root (FU-41). This rule is about
+    /// what a package can DESCRIBE — and saying otherwise would be worse than
+    /// having no rule, because the claim would carry a name saying it was checked.
+    #[test]
+    fn a_spawn_command_may_not_point_outside_the_package() {
+        for bad in ["/bin/sh", "../../elsewhere/bin", "bin/../../escape", ""] {
+            let m = manifest(
+                "out_of_process_provider",
+                &format!("spawn:\n  command: \"{bad}\"\n"),
+            );
+            assert!(m.is_err(), "{bad:?} was accepted");
+        }
+        // Controls: the two legal shapes must still pass, or "refuse everything"
+        // would satisfy the loop above.
+        assert!(manifest("out_of_process_provider", "spawn:\n  command: node\n").is_ok());
+        assert!(
+            manifest(
+                "out_of_process_provider",
+                "spawn:\n  command: bin/my-module\n"
+            )
+            .is_ok(),
+            "a path inside the package must be allowed"
+        );
+    }
+
+    /// Arguments are passed verbatim to an exec, never to a shell — so the
+    /// characters that would be dangerous in a shell are just characters here.
+    /// Asserted rather than assumed, because "we don't use a shell" is the kind
+    /// of claim that quietly stops being true.
+    #[test]
+    fn arguments_are_not_shell_interpreted() {
+        let m = manifest(
+            "out_of_process_provider",
+            "spawn:\n  command: node\n  args: [\"a b; rm -rf /\", \"$HOME\", \"*\"]\n",
+        )
+        .expect("odd-looking arguments are still just arguments");
+        assert_eq!(m.spawn().unwrap().args, ["a b; rm -rf /", "$HOME", "*"]);
     }
 }

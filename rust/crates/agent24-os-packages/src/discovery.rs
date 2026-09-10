@@ -218,10 +218,19 @@ mod tests {
     /// A manifest for a name this binary has never heard of. That is the point:
     /// `sin90` is compiled in, so discovering it would prove nothing.
     fn manifest_yaml(name: &str, kind: &str) -> String {
+        // An out-of-process module must declare how to start it (ME-3b-3), so the
+        // fixture supplies one; an in-process crate must NOT, so it supplies none.
+        // Both halves are enforced at parse time, which is why the fixture cannot
+        // just always include it.
+        let spawn = if kind == "out_of_process_provider" {
+            format!("spawn:\n  command: bin/{name}\n")
+        } else {
+            String::new()
+        };
         format!(
             "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
              event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
-             kernel_capabilities: [events]\nimpl_kind: {kind}\n"
+             kernel_capabilities: [events]\nimpl_kind: {kind}\n{spawn}"
         )
     }
 
