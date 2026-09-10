@@ -272,6 +272,15 @@ pub fn location_within(namespace: &str, request_path: &str, location: &str) -> b
         return false;
     }
     let path = location.split(['?', '#']).next().unwrap_or("");
+    if path.is_empty() {
+        // RFC 3986 §5.3: a reference with no path keeps the base's path exactly
+        // — `?page=2` means "this same resource, other query". Resolving it
+        // against the base DIRECTORY instead drops the last segment, so
+        // `/api/v1/<ns>` + `?page=2` came out as `/api/v1/`, which is outside
+        // the namespace. The request reached this proxy through the namespace,
+        // so its own path is inside it by construction.
+        return true;
+    }
     let decoded = path.replace("%2e", ".").replace("%2E", ".");
 
     let absolute = if decoded.starts_with('/') {
@@ -550,14 +559,20 @@ async fn proxy(
     // Two deadlines, because they answer different questions (§5): a module that
     // has not produced a response HEAD is wedged, while one still sending a body
     // is working. Whichever expires first wins.
-    let head_deadline = deadline.min(tokio::time::Instant::now() + state.limits.head);
+    let now = tokio::time::Instant::now();
+    let head_deadline = deadline.min(now + state.limits.head);
+    // Whichever of the two actually applies — otherwise a total deadline shorter
+    // than the head one reports "within 10s" for something that gave up after
+    // one. A message that names the wrong limit sends the reader to the wrong
+    // knob.
+    let head_budget = head_deadline.duration_since(now);
     let response = match tokio::time::timeout_at(
         head_deadline,
         state.client.request(upstream_request),
     )
     .await
     {
-        Err(_) => return timed_out(&state, TimedOut::UpstreamHead),
+        Err(_) => return timed_out(&state, TimedOut::UpstreamHead(head_budget)),
         Ok(Err(e)) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -608,46 +623,46 @@ async fn proxy(
         }
     };
 
-    // The permit rides with the BODY, not with this function.
+    // The permit rides with the BYTES.
     //
-    // Dropping it at `return` bounds how many requests are being handled, which
-    // is not the thing §2.1 says it bounds: the collected bytes are still held
-    // while hyper writes them to a client that may be reading slowly, or not at
-    // all. With the permit released there, a thousand slow readers each hold a
-    // megabyte and the ceiling has counted none of them.
-    let mut response = Response::new(Body::new(PermitBody {
-        data: Some(collected),
+    // Two versions of this were wrong before this one, in the same direction
+    // each time: the permit was released while the memory it was supposed to be
+    // counting was still held.
+    //
+    //   1. Released when the handler returned — but the collected bytes are then
+    //      being written to a client that may read slowly, or not at all.
+    //   2. Released when the response BODY was dropped — but a body hands its
+    //      `Bytes` out in a frame, and hyper holds that frame in its write queue
+    //      after dropping the body. The permit went back while the megabyte was
+    //      still queued.
+    //
+    // `Bytes::from_owner` ends the regress: the permit lives inside the
+    // allocation, so it is returned when the LAST clone of these bytes is
+    // dropped — which is the moment the memory is actually gone, and is not a
+    // moment any code here has to remember to name.
+    let mut response = Response::new(Body::from(Bytes::from_owner(PermitBytes {
+        data: collected,
         _permit: permit,
-    }));
+    })));
     *response.status_mut() = parts.status;
     *response.headers_mut() = sanitize_response_headers(&parts.headers);
     response.into_response()
 }
 
-/// A one-frame body that holds a concurrency permit until it is dropped.
-struct PermitBody {
-    data: Option<Bytes>,
+/// Bytes that hold a concurrency permit for as long as they exist.
+///
+/// Handed to [`Bytes::from_owner`], so every clone hyper makes keeps the permit
+/// alive and the last one to be dropped returns it. That is what makes the
+/// ceiling a bound on MEMORY rather than on handler count — see the call site
+/// for the two earlier versions that bounded neither.
+struct PermitBytes {
+    data: Bytes,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl hyper::body::Body for PermitBody {
-    type Data = Bytes;
-    type Error = std::convert::Infallible;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
-        std::task::Poll::Ready(
-            self.get_mut()
-                .data
-                .take()
-                .map(|b| Ok(hyper::body::Frame::data(b))),
-        )
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        hyper::body::SizeHint::with_exact(self.data.as_ref().map_or(0, Bytes::len) as u64)
+impl AsRef<[u8]> for PermitBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
     }
 }
 
@@ -657,8 +672,10 @@ impl hyper::body::Body for PermitBody {
 enum TimedOut {
     /// The client never finished sending its request.
     ClientBody,
-    /// The module accepted the request and produced no response head.
-    UpstreamHead,
+    /// The module accepted the request and produced no response head, within
+    /// the budget that actually applied (the head limit, or what was left of the
+    /// total — whichever was shorter).
+    UpstreamHead(Duration),
     /// The module started answering and did not finish.
     UpstreamBody,
 }
@@ -669,9 +686,9 @@ fn timed_out(state: &ProxyState, which: TimedOut) -> Response {
             "the request body was not received within {}s",
             state.limits.total.as_secs()
         ),
-        TimedOut::UpstreamHead => format!(
-            "the module did not begin answering within {}s",
-            state.limits.head.as_secs()
+        TimedOut::UpstreamHead(budget) => format!(
+            "the module did not begin answering within {:.1}s",
+            budget.as_secs_f32()
         ),
         TimedOut::UpstreamBody => format!(
             "the module did not finish answering within {}s",
@@ -718,14 +735,18 @@ fn head_refusal(
     // refusing a legitimate response is as much a bug as forwarding a stream. A
     // module that sends two content-types is not one whose first value should
     // decide the question either.
+    // Compared on BYTES, for the same reason `connection_tokens` is: a
+    // `Content-Type: text/event-stream; x="<non-ASCII>"` makes `to_str()` fail,
+    // and a check that treats that as "not a stream" lets the exact response it
+    // exists to refuse through — on a parameter the module chooses.
     if parts.headers.get_all(header::CONTENT_TYPE).iter().any(|v| {
-        v.to_str().is_ok_and(|v| {
-            v.split(';')
+        let media = trim_ascii_whitespace(
+            v.as_bytes()
+                .split(|b| *b == b';')
                 .next()
-                .unwrap_or("")
-                .trim()
-                .eq_ignore_ascii_case("text/event-stream")
-        })
+                .unwrap_or_default(),
+        );
+        media.eq_ignore_ascii_case(b"text/event-stream")
     }) {
         return Some(error_response(
             StatusCode::BAD_GATEWAY,
@@ -1377,6 +1398,36 @@ mod tests {
                                 .await;
                             let _ = socket.shutdown().await;
                         }
+                        // A body that never ends and never says it is a stream:
+                        // the case §2.1 admits cannot be judged at the head.
+                        "endless-chunked" => {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                                )
+                                .await;
+                            let chunk = [b'x'; 8192];
+                            loop {
+                                let mut frame = format!("{:x}\r\n", chunk.len()).into_bytes();
+                                frame.extend_from_slice(&chunk);
+                                frame.extend_from_slice(b"\r\n");
+                                if socket.write_all(&frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        // Head immediately, then one byte at a time, forever.
+                        "slow-body" => {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                                .await;
+                            loop {
+                                if socket.write_all(b"x").await.is_err() {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                        }
                         "endless-sse" => {
                             let _ = socket
                                 .write_all(
@@ -1504,7 +1555,7 @@ mod tests {
             upstream,
             Limits {
                 total: Duration::from_secs(5),
-                head: Duration::from_millis(600),
+                head: Duration::from_secs(2),
             },
             1,
         ))
@@ -1570,10 +1621,22 @@ mod tests {
         assert_eq!(
             sem.available_permits(),
             0,
-            "the permit was released while the response body was still held"
+            "the permit was released when the handler returned"
         );
-        drop(response);
-        assert_eq!(sem.available_permits(), 1, "the permit outlived its body");
+
+        // Now take the bytes OUT, the way hyper does: the frame leaves the body,
+        // and the body is dropped while the memory is still queued for a slow
+        // client. A permit tied to the BODY goes back right here — which the
+        // previous version of this test could not see, because it never polled.
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the permit went back while the bytes were still held"
+        );
+
+        drop(bytes);
+        assert_eq!(sem.available_permits(), 1, "the permit outlived its bytes");
     }
 
     #[test]
@@ -1619,8 +1682,10 @@ mod tests {
         let proxy = serve(proxy_with(
             upstream,
             Limits {
-                total: Duration::from_millis(300),
-                head: Duration::from_secs(5),
+                // Generous on purpose: the sleep below has to land INSIDE this
+                // window, and a 300ms window on a loaded CI box does not.
+                total: Duration::from_secs(2),
+                head: Duration::from_secs(10),
             },
             1,
         ))
@@ -1689,5 +1754,77 @@ mod tests {
         // And it did NOT reach the client as chunked — the proxy rebuilt the
         // framing, so the hop-by-hop header is gone.
         assert!(!got.headers.contains_key(header::TRANSFER_ENCODING));
+    }
+
+    #[test]
+    fn a_query_only_redirect_on_the_namespace_root_stays_inside_it() {
+        // RFC 3986 §5.3: a reference with no path keeps the base's path — `?page=2`
+        // means "this same resource, other query". Resolving it against the base
+        // DIRECTORY drops the last segment, so `/api/v1/zzmock` + `?page=2` came
+        // out as `/api/v1/`, and a perfectly ordinary pagination link became a
+        // 502. Refusing a legitimate response is a defect too.
+        assert!(location_within(NS, NS, "?page=2"));
+        assert!(location_within(NS, NS, "#section"));
+        assert!(location_within(NS, "/api/v1/zzmock/things/1", "?page=2"));
+        // Control: the path-bearing forms are still judged on the path.
+        assert!(!location_within(NS, NS, "/api/v1/runs?page=2"));
+    }
+
+    #[test]
+    fn a_non_ascii_content_type_parameter_does_not_hide_a_stream() {
+        // Same shape as the `Connection` byte: `to_str()` fails on a parameter
+        // the MODULE chooses, and a check that reads "not a stream" from that
+        // failure lets through the one response it exists to refuse.
+        let mut parts = Response::new(()).into_parts().0;
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_bytes(b"text/event-stream; x=\xff\xfe").unwrap(),
+        );
+        assert!(head_refusal(NS, "/api/v1/zzmock/x", &parts).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_endless_body_that_never_calls_itself_a_stream_still_terminates() {
+        // The gap §2.1 admits: without an SSE content-type there is nothing in
+        // the head to judge, so this one is caught by the 1 MiB cap instead of
+        // being refused outright. The claim being pinned is that it IS caught —
+        // and with the cap's code, not the timeout's.
+        let upstream = raw_upstream("endless-chunked").await;
+        let proxy = serve(proxy_with(upstream, Limits::default(), 8)).await;
+        let started = std::time::Instant::now();
+        let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
+        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+        assert!(
+            got.body.contains("upstream_response_too_large"),
+            "{}",
+            got.body
+        );
+        // The cap, not the 30s deadline.
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_module_that_starts_answering_and_never_finishes_hits_the_total() {
+        // The response-body deadline. Deleting it left every other test green
+        // while making a production request hang until the client gave up: the
+        // head arrives instantly here, so neither the head deadline nor the cap
+        // is what ends this.
+        let upstream = raw_upstream("slow-body").await;
+        let proxy = serve(proxy_with(
+            upstream,
+            Limits {
+                total: Duration::from_millis(600),
+                head: Duration::from_secs(10),
+            },
+            8,
+        ))
+        .await;
+        let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
+        assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            got.body.contains("did not finish answering"),
+            "the timeout named the wrong phase: {}",
+            got.body
+        );
     }
 }

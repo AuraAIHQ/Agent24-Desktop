@@ -9,7 +9,8 @@ description = "Agent24 kernel↔domain-OS protocol (ME-3b): version negotiation,
 [dependencies]
 agent24-domain = { path = "../agent24-domain" }
 axum = { version = "0.8" }
-bytes = "1"
+# 1.9 for `Bytes::from_owner` — see `PermitBytes`.
+bytes = "1.9"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
