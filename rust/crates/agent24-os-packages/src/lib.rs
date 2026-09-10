@@ -163,7 +163,7 @@ pub fn ensure_packages_root(root: &std::path::Path) -> Result<(), UnsafePackages
                     why: "it is not a directory".to_owned(),
                 });
             }
-            let uid = effective_uid()?;
+            let uid = effective_uid();
             if meta.uid() != uid {
                 return Err(UnsafePackagesRoot {
                     path: root.to_path_buf(),
@@ -185,33 +185,42 @@ pub fn ensure_packages_root(root: &std::path::Path) -> Result<(), UnsafePackages
     Ok(())
 }
 
-/// This process's effective uid, obtained WITHOUT `unsafe` and without adding a
-/// dependency for one call: create a file and ask the filesystem who owns it.
+/// This process's effective uid.
 ///
-/// The effective uid is the right one — it is what the kernel checks when this
-/// process opens the directory, so it is what the comparison must use — and a
-/// freshly created file carries exactly that. The indirection is deliberate:
-/// this crate's lints forbid `unsafe`, and one `geteuid` is not a good reason to
-/// make an exception that then sits there as precedent.
+/// # A previous version of this function opened a hole in the check it serves
 ///
-/// A failure here is reported rather than assumed away: not being able to find
-/// out who we are is not the same as being the owner.
-fn effective_uid() -> Result<u32, UnsafePackagesRoot> {
-    use std::os::unix::fs::MetadataExt;
-
-    let probe = std::env::temp_dir().join(format!(
-        "agent24-uid-probe-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let meta = std::fs::File::create(&probe)
-        .and_then(|f| f.metadata())
-        .map_err(|e| UnsafePackagesRoot {
-            path: probe.clone(),
-            why: format!("could not determine this process's uid: {e}"),
-        })?;
-    let _ = std::fs::remove_file(&probe);
-    Ok(meta.uid())
+/// It created a file in the temp directory and asked the filesystem who owned
+/// it. That is `File::create` — it **follows symlinks** and has no `O_EXCL` —
+/// and the path was derived from pid and thread id, both low-entropy and
+/// guessable. Measured in review: with the probe path pre-created as a symlink
+/// to a root-owned file, the function returned **0** while the real euid was
+/// 502.
+///
+/// The consequence ran straight through the check this module exists for: an
+/// attacker on a shared `/tmp` pre-creates that path pointing at a file THEY
+/// own → this returns THEIR uid → `ensure_packages_root` compares it against the
+/// packages root's owner → **their own packages root passes the ownership
+/// check** → they `chmod 0700` and the mode check passes too → their package's
+/// `spawn` command gets executed. **That is the same shared `/tmp`, the same
+/// pre-creation, and the same "guess the path" as the threat FU-41 names — the
+/// helper opened a second hole on the very channel it was closing.**
+///
+/// The general shape, which is why this comment is long: **a total, infallible
+/// constant (`geteuid` takes no arguments, has no failure mode, and reads no
+/// external input) was replaced by a filesystem operation with
+/// attacker-reachable input.** That is not a trade of "one more IO and one more
+/// error path" — it is trading a fact for a question somebody else can answer.
+///
+/// # Why `rustix` and not the `unsafe` this crate's lints forbid
+///
+/// Review's suggestion was to make an exception and call `geteuid` directly,
+/// arguing that "avoid unsafe" had pointed at the less safe implementation.
+/// That argument is right about the ORDERING of risks, and `rustix` settles it
+/// without paying either cost: it is already in this workspace's dependency
+/// tree, `geteuid()` there is a safe wrapper over the same syscall, and no
+/// `#[allow]` has to be planted for others to copy.
+fn effective_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
 }
 
 /// The packages root is not somewhere the daemon may safely read packages from.
@@ -477,12 +486,35 @@ mod root_safety_tests {
         assert!(ensure_packages_root(&root).is_err());
     }
 
-    /// The instrument for the ownership check. If it could not find out who we
-    /// are, `a_world_writable_root_is_refused`'s control would fail for the wrong
-    /// reason and the uid comparison would never be exercised.
+    /// The instrument for the ownership check.
+    ///
+    /// It also carries the regression for a real defect: the first version of
+    /// `effective_uid` created a file at a guessable path with `File::create`
+    /// (follows symlinks, no `O_EXCL`) and read its owner. Pre-creating that path
+    /// as a symlink to a root-owned file made it return 0. **The helper opened a
+    /// second hole on the same channel the module exists to close.**
+    ///
+    /// The regression is written as a PROPERTY rather than by re-staging that
+    /// attack: whatever `effective_uid` returns must not be influenceable by
+    /// anything on disk. A syscall satisfies that by construction; the check here
+    /// is that the answer is stable and matches a file this process just made.
     #[test]
-    fn the_uid_probe_answers() {
-        let uid = effective_uid().expect("this process has a uid");
+    fn the_uid_probe_answers_and_cannot_be_told_what_to_say() {
+        let uid = effective_uid();
+        assert_eq!(
+            uid,
+            effective_uid(),
+            "the answer must not vary between calls"
+        );
+
+        // Planting things in the temp directory must not change it. This is the
+        // shape of the old defect: the old implementation READ the filesystem to
+        // answer, so the filesystem could answer for it.
+        let decoy = std::env::temp_dir().join(format!("agent24-uid-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&decoy);
+        let _ = std::os::unix::fs::symlink("/dev/null", &decoy);
+        assert_eq!(uid, effective_uid(), "a planted symlink changed the answer");
+        let _ = std::fs::remove_file(&decoy);
         // A directory this process just made must be owned by it — that is the
         // only claim the probe makes, and it is checkable.
         let t = tempfile::tempdir().unwrap();

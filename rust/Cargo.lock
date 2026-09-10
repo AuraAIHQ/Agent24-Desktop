@@ -118,6 +118,7 @@ name = "agent24-os-packages"
 version = "0.3.0"
 dependencies = [
  "agent24-domain",
+ "rustix 0.38.44",
  "serde_yaml",
  "sha2",
  "tempfile",
