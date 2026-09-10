@@ -20,19 +20,43 @@
 //! in memory". **That is not true and a test caught it.** This module consumes at
 //! most `MAX_FRAME_BYTES + 1`, but what the TRANSPORT has already pulled into a
 //! buffer is decided by the `BufRead` it is handed: a `BufReader` built with an
-//! 8 MiB capacity will read 8 MiB from the socket to answer one `fill_buf`, and
-//! nothing here can stop it.
+//! 8 MiB capacity can pull far more than this module's bound to answer one
+//! `fill_buf`, and nothing here can stop it.
 //!
-//! So there are two properties, and only the first belongs to this module:
+//! So there is one property this module provides, and THREE REQUIREMENTS on the
+//! caller (ME-3b-3) without which it does not add up to anything. The list used
+//! to hold two of them, one of them only in a docstring and one nowhere at all —
+//! which is why they are gathered here:
 //!
 //! 1. **`read_frame` consumes at most `MAX_FRAME_BYTES + 1`.** Always, whatever
-//!    it is handed. Tested directly.
+//!    it is handed. Tested directly. **This one is ours.**
 //! 2. **The transport is not drained by an over-long frame.** True only if the
 //!    caller's buffer is bounded — a REQUIREMENT ON ME-3b-3, which constructs the
 //!    reader over the child's pipe. `BufReader::new`'s default (8 KiB) satisfies
 //!    it; `with_capacity(huge)` does not. Recorded here because the bound is
 //!    worthless if the layer above quietly undoes it, and because nothing in this
 //!    crate can enforce it.
+//!
+//!    **How much a large buffer actually pulls depends on the transport, and an
+//!    earlier version of this note got that wrong.** It said an 8 MiB `BufReader`
+//!    reads 8 MiB from the socket. Measured (review): against a `Cursor` it pulls
+//!    4194305 bytes, but against a REAL OS PIPE — which is what 3b-3 builds — it
+//!    pulls 1064960, because `fill_buf` issues ONE `read()` and a pipe returns
+//!    only what the kernel buffer holds. Good news for the design, bad news for
+//!    the sentence. The honest claim is only `pulled > MAX_FRAME_BYTES + 1`: an
+//!    unbounded buffer CAN exceed this module's bound; by how much is the
+//!    transport's business, not a number this file gets to state.
+//!
+//! 3. **The caller must stop reading frames after `TooLong`.** The stream is then
+//!    positioned inside an attacker-chosen line, so the next `read_frame` returns
+//!    a frame the peer placed there. See `read_frame`'s own docs.
+//! 4. **The reader must be BLOCKING.** Only `Interrupted` is retried; on a
+//!    non-blocking fd an ordinary `WouldBlock` becomes `FrameError::Io`, and
+//!    under SPEC's "any failure during the handshake disconnects" that turns a
+//!    routine short read into a killed connection. Nothing here can detect the
+//!    difference — `WouldBlock` is indistinguishable from a real failure at this
+//!    layer, and retrying it here would busy-spin. So it is a requirement, not a
+//!    branch. (Review, A1.)
 //!
 //! # This module has no production caller yet
 //!
@@ -49,6 +73,14 @@ use std::io::BufRead;
 /// The largest frame this kernel will read, payload only (the newline is not
 /// counted). Printed in the error so an operator does not have to read this file
 /// to learn the policy.
+///
+/// **This number was picked before its consumer existed, and exceeding it is not
+/// recoverable — it disconnects, it does not degrade.** SPEC-ME3 does not state a
+/// figure, and ME-3b-2b's `initialize` is not written yet; if that message ends
+/// up carrying capability negotiation or a tool schema, 1 MiB may be the wrong
+/// bound and the failure mode is a dead module rather than a truncated field. It
+/// must be re-checked against 3b-2b's real wire shape BEFORE 3b-2b lands, not
+/// after. See FU-42. (Review, A2.)
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Why a frame could not be read.
@@ -78,12 +110,11 @@ pub enum FrameError {
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooLong { limit } => {
-                write!(
-                    f,
-                    "frame exceeds the {limit}-byte limit and was refused unread"
-                )
-            }
+            Self::TooLong { limit } => write!(
+                f,
+                "frame exceeds the {limit}-byte limit; it was refused after reading {} bytes of it",
+                limit + 1
+            ),
             Self::Eof => f.write_str("the peer closed the connection"),
             Self::Io(e) => write!(f, "transport error: {e}"),
         }
@@ -110,6 +141,13 @@ impl std::error::Error for FrameError {
 /// which is the thing being refused. The connection is not recoverable after
 /// this error, and it is 3b-3's job to close it.
 ///
+/// **That is a requirement, not a remark.** After `TooLong` the stream sits in
+/// the middle of an attacker-chosen line, so the next `read_frame` returns
+/// whatever follows the next newline — a frame the peer placed there. A caller
+/// that logs the error and keeps reading hands that frame to the parser as if it
+/// had arrived legitimately. Nothing here can prevent it: this function does not
+/// own the connection.
+///
 /// A trailing final line without a newline is Eof, not a frame: `\n` is the
 /// delimiter, and treating "the stream ended" as "the frame ended" would let a
 /// truncated frame be parsed as a complete one.
@@ -120,27 +158,40 @@ impl std::error::Error for FrameError {
 pub fn read_frame(src: &mut impl BufRead) -> Result<Vec<u8>, FrameError> {
     let mut out = Vec::new();
     loop {
-        // The bound is checked at the TOP, before anything is read, and this
-        // placement is what makes the loop terminate rather than a happy accident.
+        // The bound and "there is room to make progress" are ONE expression, and
+        // that is the point rather than a compression.
         //
-        // It used to be at the bottom, next to the append. Then `room` (below)
-        // could evaluate to 0, the window would be empty, no newline would be
-        // found in it, `consume(0)` would make no progress, and the loop would
-        // spin forever — while a mutation test looked simply "slow". Termination
-        // depended on two separate expressions agreeing about the limit; now it
-        // depends on one. With the check here, `room` is at least 1 on every
-        // iteration, so every iteration either finds the newline, consumes at
-        // least one byte, or returns.
+        // The first version had them apart: a separate `out.len() > MAX` check,
+        // and `room = MAX + 1 - out.len()` further down. Termination then
+        // depended on those two agreeing about the limit, and a mutation that
+        // changed only one made the loop spin forever — reported by the test run
+        // as nothing at all, because a hang looks exactly like slowness. Moving
+        // the check to the top fixed the instance; merging them removes the
+        // CHOICE, so there is no longer a top-or-bottom to get wrong. (Review,
+        // PR-Daemon's second reviewer.)
         //
-        // The same move removes an underflow: `MAX + 1 - out.len()` panics in
-        // debug and WRAPS in release once `out.len()` passes `MAX + 1`, and a
-        // wrapped `room` is an unbounded read — the exact failure this function
-        // exists to prevent, in the arithmetic meant to prevent it.
-        if out.len() > MAX_FRAME_BYTES {
+        // `checked_sub` rather than `-`: the subtraction wraps in release once
+        // `out.len()` passes `MAX + 1`, and a wrapped `room` is an unbounded read
+        // — the exact failure this function exists to prevent, in the arithmetic
+        // meant to prevent it. `.filter(|r| *r > 0)` is what makes `room >= 1`,
+        // so every iteration that reaches the copy consumes at least one byte.
+        //
+        // The qualifier is load-bearing and an earlier version of this sentence
+        // omitted it: the `Interrupted => continue` arm below does none of those
+        // three things. It is bounded by the OS rather than by this loop (`read`
+        // is interrupted only by a signal), which is why the idiom is safe — and
+        // also why the unqualified sentence was false about the one branch that
+        // could actually spin. Termination has two separate reasons; stating one
+        // as though it covered both is how the other stops being examined.
+
+        let Some(room) = (MAX_FRAME_BYTES + 1)
+            .checked_sub(out.len())
+            .filter(|r| *r > 0)
+        else {
             return Err(FrameError::TooLong {
                 limit: MAX_FRAME_BYTES,
             });
-        }
+        };
         let available = match src.fill_buf() {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -152,7 +203,6 @@ pub fn read_frame(src: &mut impl BufRead) -> Result<Vec<u8>, FrameError> {
         // Only ever look at as much as could still be legal. `fill_buf` may hand
         // over a megabyte; consuming all of it because it happened to be offered
         // is how the bound stops being a bound.
-        let room = MAX_FRAME_BYTES + 1 - out.len();
         let window = &available[..available.len().min(room)];
         match window.iter().position(|&b| b == b'\n') {
             Some(i) => {
@@ -165,7 +215,15 @@ pub fn read_frame(src: &mut impl BufRead) -> Result<Vec<u8>, FrameError> {
                 // Guaranteed non-zero by the check at the top of the loop, and
                 // asserted rather than assumed: if this ever became 0 the symptom
                 // would be a hang, which is the hardest thing to see in a test run.
-                debug_assert!(taken > 0, "no progress: the loop would spin");
+                //
+                // `assert!`, not `debug_assert!`. Measured (review): with the
+                // bound check moved back to the bottom AND the limit doubled,
+                // debug turns red in 1.1s while release HANGS — `debug_assert!`
+                // is compiled out of exactly the build where the symptom is
+                // worst. A guard that disappears in release is not a guard
+                // against a production hang. The cost is one comparison per
+                // buffer refill, on a path that is about to copy those bytes.
+                assert!(taken > 0, "no progress: the loop would spin");
                 out.extend_from_slice(window);
                 src.consume(taken);
             }
@@ -294,8 +352,16 @@ mod tests {
         // hang, and a hang is the one outcome a test run reports as silence.
         for capacity in [1, 64, 8 * 1024, MAX_FRAME_BYTES * 8] {
             let mut src = source(&data, capacity);
-            let err = read_frame(&mut src).expect_err("must refuse");
-            assert!(matches!(err, FrameError::TooLong { .. }), "{err:?}");
+            // The limit is BOUND, not discarded with `..`. Measured (review):
+            // with `matches!(err, TooLong { .. })` the whole suite stayed green
+            // when the returned value was replaced by `limit: 0` and by
+            // `limit: 42` — the number an operator is told to trust was checked
+            // by nothing.
+            let FrameError::TooLong { limit } = read_frame(&mut src).expect_err("must refuse")
+            else {
+                panic!("wrong error kind for an over-long frame")
+            };
+            assert_eq!(limit, MAX_FRAME_BYTES, "capacity={capacity}");
             // Property 1 — this module's, and it holds for EVERY capacity,
             // including one large enough to offer the whole 4 MiB in a single
             // `fill_buf`. That last case is the one that matters: it is where a
@@ -317,11 +383,18 @@ mod tests {
                     pulled(&src)
                 );
             } else {
+                // `> MAX + 1`, not `> MAX * 2`. The stronger tripwire measured
+                // `Cursor` semantics rather than the property: against a real OS
+                // pipe — what 3b-3 actually builds — the same 8 MiB buffer pulls
+                // 1064960 bytes, so `> MAX * 2` is FALSE there while the claim it
+                // stands for is still true. A tripwire that only fires on the
+                // test's own transport is a fact about the test.
                 assert!(
-                    pulled(&src) > MAX_FRAME_BYTES * 2,
-                    "capacity={capacity}: expected the oversized buffer to have pulled \
-                     far more than the limit — if it no longer does, the caveat in the \
-                     module docs is stale and should be revisited, not deleted"
+                    pulled(&src) > MAX_FRAME_BYTES + 1,
+                    "capacity={capacity}: an unbounded buffer pulled only {} — if \
+                     this is now within the bound, the caveat in the module docs \
+                     is stale and should be revisited, not deleted",
+                    pulled(&src)
                 );
             }
         }
@@ -338,6 +411,27 @@ mod tests {
             src.consumed,
             legal.len(),
             "a legal frame must be consumed in full, newline included"
+        );
+    }
+
+    /// An over-long frame that is never terminated, and the stream ends.
+    ///
+    /// Both refusals are in play and only one is right: the bound was passed
+    /// BEFORE the stream ran out, so this is `TooLong`. Reporting `Eof` would
+    /// tell 3b-3 the peer hung up when in fact the peer sent too much — different
+    /// log, and in 3b-3 different restart accounting.
+    ///
+    /// This is the one thing merging the bound check into `room` could have got
+    /// wrong: computing `room` after `fill_buf` would let the empty-buffer branch
+    /// answer first.
+    #[test]
+    fn an_unterminated_over_long_frame_is_too_long_not_eof() {
+        let data = vec![b'x'; MAX_FRAME_BYTES * 2]; // no newline, then EOF
+        let mut src = source(&data, 8 * 1024);
+        let err = read_frame(&mut src).expect_err("must refuse");
+        assert!(
+            matches!(err, FrameError::TooLong { .. }),
+            "the bound was passed before the stream ended, but got {err:?}"
         );
     }
 
@@ -378,20 +472,109 @@ mod tests {
         assert_eq!(read_frame(&mut src).unwrap(), b"\xff\xfe\x00 raw");
     }
 
-    /// The error must say which of the three things happened — that is what
-    /// `FrameError` being typed is FOR (3b-3 owns the connection and needs to log
-    /// the distinction it cannot otherwise see).
+    /// A reader that fails a fixed number of times before delivering data.
+    ///
+    /// It exists because the `Err` arms of `read_frame` had NO test that reached
+    /// them. Measured (review): swapping the `Interrupted` and `Io` arms, and
+    /// even making EVERY I/O error `continue`, left all 14 tests green — and that
+    /// last one turns a real socket error into a kernel thread spinning at 100%
+    /// CPU forever on the channel this module guards. The suite never produced an
+    /// `io::Error` at all.
+    ///
+    /// The failures are FINITE on purpose. A reader that errors forever would
+    /// make the `continue`-everything mutation HANG instead of fail, and a hang
+    /// is the one outcome a test run reports as silence. One error then valid
+    /// data means the mutation returns `Ok` where `Err` is required — red, fast.
+    struct FailsThenReads {
+        remaining: Vec<std::io::ErrorKind>,
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for FailsThenReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.remaining.is_empty() {
+                return Err(std::io::Error::new(self.remaining.remove(0), "injected"));
+            }
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    fn failing(kinds: &[std::io::ErrorKind], then: &[u8]) -> BufReader<FailsThenReads> {
+        BufReader::with_capacity(
+            64,
+            FailsThenReads {
+                remaining: kinds.to_vec(),
+                data: then.to_vec(),
+                pos: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_not_reported() {
+        // `read` is interrupted by a signal, not by anything the peer did. Giving
+        // up here would turn a routine SIGCHLD into a dead module.
+        let mut src = failing(
+            &[
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Interrupted,
+            ],
+            b"payload\n",
+        );
+        assert_eq!(read_frame(&mut src).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_real_transport_error_is_reported_not_retried() {
+        // The arm that mattered: if this error were retried, a broken socket
+        // would spin forever instead of failing. The reader below WOULD deliver a
+        // valid frame on a retry, so an implementation that retries returns `Ok`
+        // — this test then fails rather than hanging.
+        let mut src = failing(&[std::io::ErrorKind::BrokenPipe], b"payload\n");
+        let err = read_frame(&mut src).expect_err("a transport error must be reported");
+        let FrameError::Io(io) = &err else {
+            panic!("a broken pipe was reported as {err:?}")
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "the cause is dropped"
+        );
+    }
+
+    /// All three failures, each PRODUCED BY `read_frame` rather than constructed
+    /// here — that is what makes this a test of the classification instead of a
+    /// test of the enum. Comparing discriminants of three hand-built variants is
+    /// true by construction and says nothing about the function.
     #[test]
     fn the_three_failures_are_distinguishable_and_the_limit_is_stated() {
-        let too_long = FrameError::TooLong {
-            limit: MAX_FRAME_BYTES,
-        };
-        assert!(too_long.to_string().contains(&MAX_FRAME_BYTES.to_string()));
-        let eof = FrameError::Eof;
-        let io = FrameError::Io(std::io::Error::other("boom"));
+        let mut over = vec![b'x'; MAX_FRAME_BYTES + 2];
+        over.push(b'\n');
+        let too_long = read_frame(&mut source(&over, 8 * 1024)).expect_err("too long");
+        let eof = read_frame(&mut source(b"", 64)).expect_err("eof");
+        let io =
+            read_frame(&mut failing(&[std::io::ErrorKind::BrokenPipe], b"x\n")).expect_err("io");
+
         let kinds = [&too_long, &eof, &io].map(std::mem::discriminant);
         assert_ne!(kinds[0], kinds[1]);
         assert_ne!(kinds[1], kinds[2]);
         assert_ne!(kinds[0], kinds[2]);
+
+        // The limit reaches the operator through the message, which is what
+        // `MAX_FRAME_BYTES`'s own doc comment promises ("so an operator does not
+        // have to read this file"). Asserted on the error `read_frame` returned,
+        // not on one built here with the answer already in it.
+        assert!(
+            too_long.to_string().contains(&MAX_FRAME_BYTES.to_string()),
+            "{too_long}"
+        );
+        // Each message says something the others do not — `Display` collapsing to
+        // one sentence would pass the discriminant check above.
+        assert!(eof.to_string().contains("closed"), "{eof}");
+        assert!(io.to_string().contains("transport"), "{io}");
     }
 }
