@@ -1,8 +1,9 @@
 //! ME-3b — the kernel↔domain-OS protocol.
 //!
-//! Today this crate holds one thing: the version negotiation the `initialize`
-//! handshake performs ([`version`]). Framing (ME-3b-1) and the `initialize` wire
-//! shape (ME-3b-2b) land here next.
+//! Today this crate holds two: the version negotiation the `initialize`
+//! handshake performs ([`version`]), and the framing that reads one line off the
+//! callback channel ([`frame`]). The `initialize` wire shape (ME-3b-2b) — the
+//! consumer of both — lands here next.
 //!
 //! # Why negotiation is here and not inside the handshake
 //!
@@ -13,4 +14,5 @@
 //! implementation, which makes it the one part of ME-3b whose expected answers
 //! are not decided by whoever writes the code.
 
+pub mod frame;
 pub mod version;
