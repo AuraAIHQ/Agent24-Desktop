@@ -133,6 +133,19 @@ pub fn strips_from_request(name: &str) -> bool {
             // We buffer the body, so a 100-continue dance would be answered by
             // the module for a body it is not the one reading.
             | "expect"
+            // A client can send these itself and the kernel does not rewrite
+            // them, so a module that rate-limits on `X-Forwarded-For`, or builds
+            // a link from `X-Forwarded-Host`, is trusting a value the caller
+            // chose. It is also the asymmetry `host` above would otherwise
+            // leave: the real authority hidden, a forged one not. Dropped rather
+            // than minted — the kernel HAS the peer address, but nothing has
+            // asked for it, and minting a header no module reads is inventing a
+            // contract (FU-45).
+            | "forwarded"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+            | "x-real-ip"
         )
 }
 
@@ -154,6 +167,18 @@ pub fn strips_from_response(name: &str) -> bool {
                 | "authorization"
                 | "authentication-info"
                 | "proxy-authentication-info"
+                // `Refresh: 0; url=http://evil.example` is non-standard and
+                // honoured by every major browser — the header form of
+                // `<meta http-equiv="refresh">`. It navigates, so it does
+                // `Location`'s job while going nowhere near `location_within`:
+                // no scheme check, no `//host`, no `%2e`, no tab, no duplicate
+                // rule. **A rule that names one header is not a rule about
+                // redirection.**
+                //
+                // Dropped rather than checked: checking it would amount to
+                // supporting it as a redirect mechanism, and `Location` already
+                // covers every legitimate use.
+                | "refresh"
         )
 }
 
@@ -254,6 +279,14 @@ pub fn sanitize_response_headers(from_module: &HeaderMap) -> HeaderMap {
 /// the module owns its namespace's content, and a rule about the `Location`
 /// header is about the header, not about making redirection impossible. What it
 /// does buy is that the kernel's own surface never carries the redirect.
+///
+/// **That last sentence was false when it was first written**, and the header
+/// that made it false was `Refresh` — same navigation, same arbitrary URL, and
+/// none of this function. It is dropped outright by [`strips_from_response`],
+/// which is what makes the sentence true. The lesson is the shape rather than
+/// that one header: **this function is a rule about `Location`, and the claim
+/// above is about REDIRECTION.** Anything else that navigates has to be handled
+/// over there, not here.
 pub fn location_within(namespace: &str, request_path: &str, location: &str) -> bool {
     // Browsers DELETE ASCII tab and newline while parsing a URL, so
     // `/api/v1/<ns>/\t..\t/runs` is inside the namespace to this function and
@@ -346,6 +379,12 @@ struct ProxyState {
     /// module, not one per daemon: a wedged module must degrade its own
     /// namespace, not everyone else's.
     inflight: Arc<tokio::sync::Semaphore>,
+    /// How many that is. Carried rather than read back from the constant, for
+    /// the same reason `TimedOut` carries its budget: the message has to name
+    /// the limit that ACTUALLY applies. Today the two are equal in production,
+    /// so the constant is not yet wrong — only unguarded, and the day this
+    /// becomes per-module the text starts lying with nothing to catch it.
+    capacity: usize,
 }
 
 /// Deadlines, as data rather than as constants read at the call site.
@@ -476,6 +515,7 @@ fn state_with(
         ids: Arc::new(RequestIds::new()),
         limits,
         inflight: Arc::new(tokio::sync::Semaphore::new(inflight)),
+        capacity: inflight,
     }
 }
 
@@ -497,7 +537,10 @@ async fn proxy(
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "module_overloaded",
-            &format!("the module already has {MAX_INFLIGHT_PER_MODULE} requests in flight"),
+            &format!(
+                "the module already has {} requests in flight",
+                state.capacity
+            ),
         );
     };
 
@@ -1014,6 +1057,13 @@ mod tests {
                 .status(StatusCode::FOUND)
                 .header(header::LOCATION, to)
                 .body(Body::empty())
+                .unwrap();
+        }
+        if path.ends_with("/refresh") {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("refresh", query.strip_prefix("to=").unwrap_or("0"))
+                .body(Body::from("ok"))
                 .unwrap();
         }
         if path.ends_with("/echo-secrets") {
@@ -1968,5 +2018,117 @@ mod tests {
             "the budget was the whole total, ignoring what the client spent: {reply}"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_module_cannot_navigate_the_client_with_a_refresh_header() {
+        // `Refresh` does `Location`'s job and none of `location_within` runs on
+        // it: no scheme check, no `//host`, no `%2e`, no tab, no duplicate rule.
+        // Every major browser honours it. So the doc line saying "the kernel's
+        // own surface never carries the redirect" was false until this header
+        // was dropped — a rule that names ONE header is not a rule about
+        // redirection.
+        let (proxy, _) = proxied().await;
+        let got = call(
+            proxy,
+            Method::GET,
+            &format!("{NS}/refresh?to=0;url=http://evil.example/"),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert!(
+            !got.headers.contains_key("refresh"),
+            "the module navigated the client off the kernel's surface"
+        );
+        // Control: an in-namespace `Location` still gets through, so this is not
+        // "strip anything that looks like navigation".
+        let got = call(
+            proxy,
+            Method::GET,
+            &format!("{NS}/redirect?to={NS}/ok"),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::FOUND);
+        assert!(got.headers.contains_key(header::LOCATION));
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_tell_a_module_where_it_came_from() {
+        // The kernel is the only hop, and it does not rewrite these — so a
+        // module reading `X-Forwarded-For` would be reading a value the caller
+        // typed. Also the asymmetry `host` would otherwise leave: the real
+        // authority stripped, a forged one forwarded.
+        let (proxy, _) = proxied().await;
+        let got = call(
+            proxy,
+            Method::GET,
+            &format!("{NS}/echo"),
+            &[
+                ("x-forwarded-for", "1.2.3.4"),
+                ("x-forwarded-host", "evil.example"),
+                ("x-forwarded-proto", "https"),
+                ("x-real-ip", "1.2.3.4"),
+                ("forwarded", "for=1.2.3.4"),
+                // Positive control: a header with a similar shape survives, so
+                // this is not a prefix sweep.
+                ("x-forwarded-by-nobody", "kept"),
+            ],
+            "",
+        )
+        .await;
+        let seen = got.json();
+        for gone in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-real-ip",
+            "forwarded",
+        ] {
+            assert!(
+                seen["headers"].get(gone).is_none(),
+                "{gone} reached the module"
+            );
+        }
+        assert_eq!(seen["headers"]["x-forwarded-by-nobody"], "kept");
+    }
+
+    #[tokio::test]
+    async fn the_overload_message_names_the_ceiling_that_applies() {
+        // Same defect as the head budget, caught before it could bite: the text
+        // read the CONSTANT while the ceiling came from the state. They are
+        // equal in production, so nothing would have reported it — until the day
+        // this becomes per-module, when the message starts lying quietly.
+        let upstream = raw_upstream("silence").await;
+        let (app, sem) = proxy_and_permits(
+            upstream,
+            Limits {
+                total: Duration::from_secs(5),
+                head: Duration::from_secs(2),
+            },
+            1,
+        );
+        let proxy = serve(app).await;
+
+        let first = tokio::spawn(async move {
+            call(proxy, Method::GET, &format!("{NS}/wedged"), &[], "").await
+        });
+        wait_for_permits(&sem, 0).await;
+        let refused = call(proxy, Method::GET, &format!("{NS}/second"), &[], "").await;
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            refused.body.contains("has 1 requests"),
+            "the message named a ceiling that is not the one in force: {}",
+            refused.body
+        );
+        assert!(
+            !refused.body.contains(&MAX_INFLIGHT_PER_MODULE.to_string()),
+            "{}",
+            refused.body
+        );
+        let _ = first.await;
     }
 }
