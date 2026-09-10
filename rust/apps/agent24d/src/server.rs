@@ -987,6 +987,18 @@ fn with_discovered(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
 ) -> Vec<crate::domain::Installed> {
+    // FU-41. Checked HERE, at the one place packages are read, rather than at
+    // startup: a check somewhere else can be true when it runs and false when
+    // the directory is used, and this is the moment of use.
+    //
+    // A refusal SKIPS discovery entirely and keeps the compiled-in catalogue.
+    // That is the safe direction — a daemon with only its built-in modules still
+    // works — and it is loud, because from ME-3b-3 a package in a directory
+    // somebody else can write decides what this process executes.
+    if let Err(e) = agent24_os_packages::ensure_packages_root(packages_root) {
+        tracing::error!("{e}; no disk packages will be loaded this run");
+        return catalogue;
+    }
     let scan = agent24_os_packages::discovery::scan(packages_root);
     for r in &scan.refused {
         tracing::warn!(
@@ -1055,6 +1067,39 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         pkg(root.path(), "cos72");
 
+        let out = super::with_discovered(vec![built_in("sin90")], root.path());
+        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["sin90", "cos72"]);
+    }
+
+    /// FU-41's wiring. The library gained `ensure_packages_root`; a library
+    /// function nobody calls closes nothing.
+    ///
+    /// The refusal must SKIP discovery and keep the built-ins — a daemon with
+    /// only its compiled-in modules still works, while one that loaded a package
+    /// from a directory anyone could write would be executing a program of their
+    /// choosing (the manifest carries a `spawn` command as of ME-3b-3).
+    #[test]
+    fn a_world_writable_packages_root_is_not_read_at_all() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        pkg(root.path(), "cos72");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let out = super::with_discovered(vec![built_in("sin90")], root.path());
+        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["sin90"],
+            "a package in an unsafe root was loaded"
+        );
+
+        // Control: the SAME root with the SAME package, tightened, is read. So
+        // the skip above is about the mode — not about the package being
+        // unreadable for some other reason, which would make this test pass for
+        // a reason that has nothing to do with FU-41.
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let out = super::with_discovered(vec![built_in("sin90")], root.path());
         let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);

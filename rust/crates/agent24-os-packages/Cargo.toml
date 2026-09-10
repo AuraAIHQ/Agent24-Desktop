@@ -9,6 +9,10 @@ description = "Agent24 domain-OS packages on disk (ME-3a): discovery and atomic 
 [dependencies]
 agent24-domain = { path = "../agent24-domain" }
 serde_yaml = "0.9"
+# For `geteuid` — a SAFE wrapper over the syscall. See `effective_uid`: the
+# dependency-free alternative (create a file, ask who owns it) was attacker-
+# influenceable, which is a worse trade than one small crate.
+rustix = { version = "0.38", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"
