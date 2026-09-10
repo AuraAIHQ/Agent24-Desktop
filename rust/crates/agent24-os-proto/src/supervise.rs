@@ -34,6 +34,12 @@ pub const BASE_BACKOFF: Duration = Duration::from_millis(500);
 /// A process CAN survive `SIGKILL` — while blocked in an uninterruptible state,
 /// typically a stuck filesystem or device. Waiting forever for that is how a
 /// supervisor becomes the thing that is stuck.
+///
+/// **The 5 seconds is an ASSUMPTION, not a measurement.** Nothing here has been
+/// run against a genuinely stuck device; it is a number chosen to be longer than
+/// any ordinary reap and shorter than a human's patience. Replace it with a
+/// measured value if one ever exists, and treat a timeout as "report it", never
+/// as "wait a bit more".
 pub const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many consecutive failures trip the breaker.
@@ -214,15 +220,23 @@ pub fn terminate_group(child: &mut std::process::Child, grace: Duration) -> std:
 
     signal_group(Signal::Kill)?;
 
-    // Bounded, not `child.wait()`. A blocking wait here can hang forever, and
-    // **a supervisor that can block forever is the failure mode this function
-    // exists to prevent** — the caller is the thing that is supposed to notice a
-    // stuck module.
+    // Bounded, not `child.wait()`. **Two reasons, and an earlier version of this
+    // comment gave a third that does not hold.**
     //
-    // Found by a mutation: removing the `SIGKILL` above made `child.wait()` hang
-    // instead of failing a test, and a hang is the one outcome a test run
-    // reports as silence. The mutation was right about the code, and the code
-    // was wrong in a second way it happened to expose.
+    // What it said was that a blocking wait "can hang forever". Review settled
+    // that with a 2×2: keep the `SIGKILL` above and put the blocking `wait()`
+    // back, and the suite is green — the hang needs the `SIGKILL` to be MISSING,
+    // i.e. it needs the code to be broken in the way the mutation broke it.
+    // **That sentence attributed a mutant's failure to the shipped code.**
+    //
+    // The two reasons that do hold:
+    //
+    // 1. **Testability.** With a blocking wait, the mutation that drops the
+    //    `SIGKILL` HANGS rather than failing — and a hang is the one outcome a
+    //    test run reports as silence. Bounded polling turns that mutation red.
+    // 2. **`SIGKILL` is not a guarantee of reaping.** A process blocked in an
+    //    uninterruptible state (a stuck filesystem or device) stays until it
+    //    unblocks. That is real, and it is NOT what the mutation showed.
     let hard_deadline = Instant::now() + REAP_TIMEOUT;
     while Instant::now() < hard_deadline {
         if child.try_wait()?.is_some() {
@@ -246,6 +260,22 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    /// Write an executable and **close the handle before anyone execs it**.
+    ///
+    /// The `drop` is the whole point. The first version of these tests held a
+    /// `File` open for writing while spawning, and **Linux's `execve` returns
+    /// `ETXTBSY` for a binary any process has open for writing** — macOS does not
+    /// enforce that. So three tests were green on this machine and red in CI,
+    /// with `Text file busy`.
+    ///
+    /// `std::fs::write` leaves no handle at all, which is why it is used here
+    /// rather than remembering to drop one.
+    fn exe(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// The backoff schedule, as a table. Written out rather than computed,
@@ -386,9 +416,6 @@ mod tests {
     /// invisible to a `disable` that reported success.
     #[test]
     fn terminating_kills_the_helper_too_not_just_the_module() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("bin")).unwrap();
         let marker = dir.path().join("helper-alive");
@@ -399,10 +426,7 @@ mod tests {
              sleep 30\n",
             m = marker.display()
         );
-        let prog = dir.path().join("bin/mod");
-        let mut f = std::fs::File::create(&prog).unwrap();
-        f.write_all(script.as_bytes()).unwrap();
-        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exe(&dir.path().join("bin/mod"), &script);
 
         let spawn_cmd = agent24_domain::SpawnCommand {
             command: "bin/mod".to_owned(),
@@ -440,13 +464,8 @@ mod tests {
     /// SIGTERM first, and a module that ignores it still goes away.
     #[test]
     fn a_module_that_ignores_sigterm_is_still_killed() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("bin")).unwrap();
-        let prog = dir.path().join("bin/mod");
-        let mut f = std::fs::File::create(&prog).unwrap();
         // A BUSY loop, not `sleep`. The first version was `trap '' TERM;
         // sleep 30` — and it exited almost immediately, correctly: the trap
         // protects the shell, but `sleep` is a separate process in the same
@@ -454,15 +473,13 @@ mod tests {
         // shell fell through. The test's premise was wrong, not its assertion.
         // A shell builtin loop has no child to kill in its place.
         let ready = dir.path().join("trap-installed");
-        f.write_all(
-            format!(
+        exe(
+            &dir.path().join("bin/mod"),
+            &format!(
                 "#!/bin/sh\ntrap '' TERM\ntouch {}\nwhile : ; do : ; done\n",
                 ready.display()
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ),
+        );
 
         let spawn_cmd = agent24_domain::SpawnCommand {
             command: "bin/mod".to_owned(),
@@ -497,15 +514,9 @@ mod tests {
     /// reuse the one a failed handshake already saw.
     #[test]
     fn a_restart_does_not_reuse_the_token() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("bin")).unwrap();
-        let prog = dir.path().join("bin/mod");
-        let mut f = std::fs::File::create(&prog).unwrap();
-        f.write_all(b"#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exe(&dir.path().join("bin/mod"), "#!/bin/sh\nexit 1\n");
 
         let spawn_cmd = agent24_domain::SpawnCommand {
             command: "bin/mod".to_owned(),
