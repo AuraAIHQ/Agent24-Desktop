@@ -274,10 +274,29 @@ impl SpawnCommand {
     /// `..`. Allowed: a bare name (resolved on `PATH`) or a relative path inside
     /// the package.
     ///
-    /// The rule is not a security boundary — see the type's docs — it is about
-    /// what a package can DESCRIBE. A package that names `/bin/sh` or
-    /// `../../elsewhere` is describing something outside itself, and a package
-    /// that is not self-describing cannot be reviewed by reading it.
+    /// The rule is not a security boundary — see the type's docs. What it
+    /// actually provides is narrower than an earlier version of this comment
+    /// claimed, and the narrower statement is the honest one: **the manifest
+    /// contains no spelled-out path escape.**
+    ///
+    /// It does NOT establish that a package can be reviewed by reading it, and
+    /// two things defeat that reading (both measured in review):
+    ///
+    /// - **It distinguishes by spelling, not by target.** `/bin/sh` is refused
+    ///   while `sh` is accepted — the same program. `env` is worse: `command:
+    ///   env` with `args: [FOO=1, sh, -c, …]` is entirely legal. Bare-name
+    ///   resolution through `PATH` is deliberate (it is what lets `node` work),
+    ///   so this is not a defect in the rule; `/bin/sh` was simply a bad example
+    ///   of what the rule buys.
+    /// - **A symlink inside the package is invisible to it.** `command:
+    ///   bin/node` passes while `bin/node` points at `/bin/sh`, because this
+    ///   check is purely lexical.
+    ///
+    /// Neither gives an attacker anything new — whoever can write the manifest
+    /// can write the package directory too. What they take away is the BENEFIT
+    /// this rule was said to provide. The load-bearing check belongs where the
+    /// program is actually started (ME-3b-3): canonicalise, and refuse anything
+    /// that no longer lies under the package root.
     ///
     /// # Errors
     ///
@@ -401,7 +420,15 @@ const RESERVED_NAMES: &[&str] = &[
 /// Conservative cap: the name becomes one path SEGMENT, and most filesystems cap
 /// a segment at 255 bytes. 64 leaves room for any suffix and keeps a manifest from
 /// validating only to fail at mkdir.
-const MAX_NAME_BYTES: usize = 64;
+/// Longest a module name may be, in bytes.
+///
+/// Public because a test in another crate needs the REAL bound rather than a
+/// guessed one: `agent24-os-proto` measures the largest possible `initialize`
+/// frame against the frame limit, and an over-wide guess there eats slack that
+/// does not exist — which turns into a spurious red over a name that can never
+/// occur, and then someone edits the test. Exporting it means that measurement
+/// follows this constant if it ever changes.
+pub const MAX_NAME_BYTES: usize = 64;
 
 /// Lowercase ASCII alphanumerics plus `-`/`_`, starting alphanumeric, bounded, and
 /// not a reserved device name. Deliberately stricter than the event schema's
