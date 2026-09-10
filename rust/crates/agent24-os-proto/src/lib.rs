@@ -15,4 +15,5 @@
 //! are not decided by whoever writes the code.
 
 pub mod frame;
+pub mod initialize;
 pub mod version;

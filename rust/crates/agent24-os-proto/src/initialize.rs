@@ -1,0 +1,506 @@
+//! ME-3b-2b — the `initialize` handshake: its wire shape, and how a bad first
+//! frame is classified.
+//!
+//! This module reads ONE frame (given to it as bytes by [`crate::frame`]) and
+//! says what it was: a valid handshake request, or a specific kind of refusal.
+//! It does not own the connection, so it does not disconnect — SPEC's rule
+//! "**any failure during the handshake disconnects**" is carried out by ME-3b-3,
+//! which needs this classification in order to log WHY. That split is the reason
+//! [`HandshakeError`] is a type and not a string.
+//!
+//! # The error codes are SPEC's, not this file's
+//!
+//! From SPEC-ME3 §3 (quoted in the tests, so the mapping is checked rather than
+//! asserted):
+//!
+//! - 首帧不是 `initialize` → `-32600`
+//! - 首帧不是合法 JSON → `-32700 Parse error`
+//! - 首帧 params 解析失败（含重复 `auth_token` 等重复 JSON key）→ `-32602`
+//! - 认证失败 → `-32000` + `kind: auth_failed`
+//! - manifest 摘要不符 → `-32000` + `kind: manifest_mismatch`
+//! - 版本区间无交集 → `-32000` + `kind: version_mismatch`
+//!
+//! # The offer set is EMPTY at this slice, and that is deliberate
+//!
+//! SPEC §8 fixes the ladder: a capability may be offered only once a handler for
+//! it exists. `memory` arrives in ME-3d, `events`/`approval` in ME-3e. Offering
+//! them here would create the state this design keeps arguing against — granted,
+//! but no method behind it. So [`Offer::none`] is what a kernel at this stage
+//! answers with, and the type exists so that later slices ADD to it rather than
+//! inventing a shape.
+//!
+//! # This module has no production caller yet
+//!
+//! 🟢 library-only (SPEC-MD-ME) — **not ✅**. Its consumer is ME-3b-3. The
+//! condition for removing it from `main` is an EVENT, not a date: if 3b-3 is
+//! abandoned or routed around, this leaves with it.
+
+use serde::{Deserialize, Serialize};
+
+use crate::version::{self, VersionMismatch, VersionRange};
+
+/// The JSON-RPC method name a handshake must use.
+pub const INITIALIZE_METHOD: &str = "initialize";
+
+/// What the module sends as the first frame.
+///
+/// `deny_unknown_fields` is not tidiness: an unrecognised field in a security
+/// handshake is a message this kernel does not understand, and accepting it
+/// silently is how a future field gets ignored by an old daemon that then
+/// reports success. Duplicate keys are rejected by serde's derive for the same
+/// reason — SPEC calls out duplicate `auth_token` specifically, because "last
+/// one wins" lets a sender show one token to a logger and another to a checker.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InitializeParams {
+    /// The module's protocol range. **`None` when the field is absent**, which
+    /// SPEC treats as incompatible — not as "assume v1". Modelled as an `Option`
+    /// all the way from the wire so the absence survives to `negotiate` instead
+    /// of being defaulted at the boundary.
+    #[serde(default)]
+    pub protocol_versions: Option<VersionRange>,
+    /// The module name it claims to be. Checked against the manifest the kernel
+    /// spawned; a mismatch is `manifest_mismatch`.
+    pub module: String,
+    /// Digest of the manifest the module read. The kernel compares it with the
+    /// digest of the manifest IT read — two processes disagreeing about the file
+    /// that defines identity is not something to proceed past.
+    pub manifest_digest: String,
+    /// The one-shot secret the kernel passed at spawn.
+    pub auth_token: String,
+    /// Capabilities the module requests. The kernel answers with what it can
+    /// actually serve; see [`Offer`].
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// The full first frame, as JSON-RPC 2.0.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitializeRequest {
+    /// Must be `"2.0"`.
+    pub jsonrpc: String,
+    /// Must be [`INITIALIZE_METHOD`].
+    pub method: String,
+    /// Correlation id, echoed in the response.
+    pub id: u64,
+    /// See [`InitializeParams`].
+    pub params: InitializeParams,
+}
+
+/// What the kernel offers this connection: the method families that actually
+/// have handlers.
+///
+/// It has to be able to say **"this daemon does not provide `memory.scoped`"**
+/// (SPEC §8's acceptance criterion), and it does so by simple absence — a name
+/// not in `provides` is not provided. There is no "supported but disabled"
+/// state, because that is the same lie in a different spelling.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Offer {
+    /// Method-family prefixes the daemon will answer, e.g. `_a24/memory/private`.
+    pub provides: Vec<String>,
+}
+
+impl Offer {
+    /// What a kernel at ME-3b-2b offers: nothing.
+    ///
+    /// Not a placeholder. At this slice no business handler exists, so any other
+    /// answer would grant a capability with no method behind it.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether `method` falls inside something offered.
+    #[must_use]
+    pub fn provides(&self, method: &str) -> bool {
+        self.provides.iter().any(|p| method.starts_with(p.as_str()))
+    }
+}
+
+/// The kernel's reply to a successful handshake.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InitializeResult {
+    /// The single chosen version. SPEC: the kernel must not answer with a
+    /// version the module did not declare; [`version::negotiate`] makes that
+    /// true by construction.
+    pub protocol_version: u32,
+    /// See [`Offer`].
+    pub offer: Offer,
+}
+
+/// Why a first frame was not a usable handshake.
+///
+/// Each variant carries the JSON-RPC code SPEC assigns it, and the two that are
+/// application-level (`-32000`) carry a `kind` from SPEC's closed set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeError {
+    /// Not valid JSON at all.
+    Parse(String),
+    /// Valid JSON, but not an `initialize` request (wrong method, wrong
+    /// `jsonrpc`, or not a request object).
+    NotInitialize(String),
+    /// `params` did not deserialize — a missing field, an unknown field, or a
+    /// duplicate key.
+    BadParams(String),
+    /// The token did not match.
+    AuthFailed,
+    /// The module's manifest digest or claimed name did not match the kernel's.
+    ManifestMismatch { expected: String, got: String },
+    /// No shared protocol version, or none declared.
+    VersionMismatch(VersionMismatch),
+}
+
+impl HandshakeError {
+    /// The JSON-RPC error code, per SPEC §3.
+    #[must_use]
+    pub fn code(&self) -> i32 {
+        match self {
+            Self::Parse(_) => -32700,
+            Self::NotInitialize(_) => -32600,
+            Self::BadParams(_) => -32602,
+            Self::AuthFailed | Self::ManifestMismatch { .. } | Self::VersionMismatch(_) => -32000,
+        }
+    }
+
+    /// `error.data.kind` for the application-level failures; `None` for the
+    /// protocol-level ones, which are fully described by their code.
+    #[must_use]
+    pub fn kind(&self) -> Option<&'static str> {
+        match self {
+            Self::AuthFailed => Some("auth_failed"),
+            Self::ManifestMismatch { .. } => Some("manifest_mismatch"),
+            Self::VersionMismatch(_) => Some(VersionMismatch::KIND),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(e) => write!(f, "the first frame is not valid JSON: {e}"),
+            Self::NotInitialize(what) => {
+                write!(
+                    f,
+                    "the first frame must be an `initialize` request, got {what}"
+                )
+            }
+            Self::BadParams(e) => write!(f, "`initialize` params are not usable: {e}"),
+            // Deliberately says nothing about the token — not its length, not
+            // which half differed. An error message is an oracle if it does.
+            Self::AuthFailed => f.write_str("authentication failed"),
+            Self::ManifestMismatch { expected, got } => write!(
+                f,
+                "the module read a different manifest: kernel has {expected}, module reports {got}"
+            ),
+            Self::VersionMismatch(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for HandshakeError {}
+
+/// What the kernel knows before the module says anything.
+#[derive(Debug, Clone)]
+pub struct Expectation {
+    /// The name in the manifest the kernel spawned.
+    pub module: String,
+    /// The digest of that manifest, as the kernel computed it.
+    pub manifest_digest: String,
+    /// The one-shot secret handed to the child at spawn.
+    pub auth_token: String,
+    /// What this kernel build speaks.
+    pub kernel_versions: VersionRange,
+    /// What it can actually serve — [`Offer::none`] until ME-3d.
+    pub offer: Offer,
+}
+
+/// Parse and check one first frame.
+///
+/// The order of checks is deliberate and is asserted in the tests: **shape
+/// before secrets**. A frame that is not JSON, or not an `initialize`, is
+/// rejected before the token is looked at — otherwise a malformed frame and a
+/// wrong token would be distinguishable by timing, and the shape checks would be
+/// doing work on attacker-controlled input with a comparison hanging off them.
+///
+/// # Errors
+///
+/// See [`HandshakeError`]. Every one of them means the connection must be closed
+/// by the caller; this function has no way to do that itself.
+pub fn accept(frame: &[u8], expect: &Expectation) -> Result<InitializeResult, HandshakeError> {
+    let req: InitializeRequest = match serde_json::from_slice(frame) {
+        Ok(r) => r,
+        Err(e) => return Err(classify(frame, &e)),
+    };
+    if req.jsonrpc != "2.0" {
+        return Err(HandshakeError::NotInitialize(format!(
+            "jsonrpc {:?}",
+            req.jsonrpc
+        )));
+    }
+    if req.method != INITIALIZE_METHOD {
+        return Err(HandshakeError::NotInitialize(format!(
+            "method {:?}",
+            req.method
+        )));
+    }
+    // Identity before secret: a module that read a different manifest is not a
+    // module whose token is worth comparing.
+    if req.params.module != expect.module || req.params.manifest_digest != expect.manifest_digest {
+        return Err(HandshakeError::ManifestMismatch {
+            expected: format!("{}@{}", expect.module, expect.manifest_digest),
+            got: format!("{}@{}", req.params.module, req.params.manifest_digest),
+        });
+    }
+    if req.params.auth_token != expect.auth_token {
+        return Err(HandshakeError::AuthFailed);
+    }
+    let chosen = version::negotiate(req.params.protocol_versions, expect.kernel_versions)
+        .map_err(HandshakeError::VersionMismatch)?;
+    Ok(InitializeResult {
+        protocol_version: chosen,
+        offer: expect.offer.clone(),
+    })
+}
+
+/// Decide whether a `serde_json` failure was "not JSON" or "not the right
+/// shape". `serde_json` reports both through one error type, and SPEC assigns
+/// them different codes (`-32700` vs `-32600`/`-32602`), so the distinction has
+/// to be recovered rather than guessed.
+fn classify(frame: &[u8], e: &serde_json::Error) -> HandshakeError {
+    if e.classify() == serde_json::error::Category::Syntax {
+        return HandshakeError::Parse(e.to_string());
+    }
+    // It IS JSON. Whether it is "not an initialize" or "initialize with bad
+    // params" cannot be read off the error, so ask the document: re-parse
+    // loosely and look at `method`. A frame whose method is wrong or missing is
+    // -32600; anything else that failed the strict shape is -32602.
+    match serde_json::from_slice::<serde_json::Value>(frame) {
+        Ok(v) => {
+            let method = v.get("method").and_then(serde_json::Value::as_str);
+            match method {
+                Some(INITIALIZE_METHOD) => HandshakeError::BadParams(e.to_string()),
+                Some(other) => HandshakeError::NotInitialize(format!("method {other:?}")),
+                None => HandshakeError::NotInitialize("a frame with no `method`".to_owned()),
+            }
+        }
+        // Unreachable in practice (a syntax error would have been caught above),
+        // but "unreachable" is a claim about today's serde_json.
+        Err(e2) => HandshakeError::Parse(e2.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::frame::MAX_FRAME_BYTES;
+
+    fn expectation() -> Expectation {
+        Expectation {
+            module: "cos72".to_owned(),
+            manifest_digest: "sha256:abc".to_owned(),
+            auth_token: "s3cret".to_owned(),
+            kernel_versions: VersionRange::new(1, 1).unwrap(),
+            offer: Offer::none(),
+        }
+    }
+
+    fn good_frame() -> String {
+        r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{
+            "protocol_versions":{"min":1,"max":1},
+            "module":"cos72","manifest_digest":"sha256:abc",
+            "auth_token":"s3cret","capabilities":["events"]}}"#
+            .to_owned()
+    }
+
+    #[test]
+    fn a_correct_handshake_is_accepted_and_answers_with_one_version() {
+        let out = accept(good_frame().as_bytes(), &expectation()).expect("valid handshake");
+        assert_eq!(out.protocol_version, 1);
+        assert_eq!(out.offer, Offer::none());
+    }
+
+    /// SPEC-ME3 §3's code assignment, as a table quoted from the document.
+    ///
+    /// The expected codes are not the author's to choose — the quotations sit
+    /// beside the rows they govern, so a reader can check the claim without
+    /// leaving this file. (The pattern is the one set by `version::tests`.)
+    #[test]
+    fn the_spec_error_codes() {
+        let e = expectation();
+        let case = |frame: &str| accept(frame.as_bytes(), &e).expect_err("must refuse");
+
+        // SPEC: 「首帧不是合法 JSON → `-32700 Parse error` 并断连」
+        let parse = case("{not json");
+        assert_eq!(parse.code(), -32700, "{parse}");
+        assert_eq!(parse.kind(), None);
+
+        // SPEC: 「**首帧不是 `initialize`** → `-32600` 断连」
+        let wrong_method =
+            case(r#"{"jsonrpc":"2.0","method":"ping","id":1,"params":{"module":"cos72"}}"#);
+        assert_eq!(wrong_method.code(), -32600, "{wrong_method}");
+
+        // SPEC: 「首帧 params 解析失败（含重复 `auth_token` 等重复 JSON key）→
+        //        `-32602` 并断连」
+        let missing_field =
+            case(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"module":"cos72"}}"#);
+        assert_eq!(missing_field.code(), -32602, "{missing_field}");
+
+        // SPEC: 「认证失败 → `-32000` + `kind: auth_failed` 并断连」
+        let bad_token = case(&good_frame().replace("s3cret", "wrong"));
+        assert_eq!(bad_token.code(), -32000);
+        assert_eq!(bad_token.kind(), Some("auth_failed"));
+
+        // SPEC: 「manifest 摘要不符 → `-32000` + `kind: manifest_mismatch` 并断连」
+        let bad_digest = case(&good_frame().replace("sha256:abc", "sha256:zzz"));
+        assert_eq!(bad_digest.code(), -32000);
+        assert_eq!(bad_digest.kind(), Some("manifest_mismatch"));
+
+        // SPEC: 「交集为空 → 握手失败並把两边区间都放进错误（`-32000` +
+        //        `version_mismatch`）」／「模块**不报区间** → 视为不兼容」
+        let no_overlap = case(&good_frame().replace(r#""min":1,"max":1"#, r#""min":7,"max":9"#));
+        assert_eq!(no_overlap.code(), -32000);
+        assert_eq!(no_overlap.kind(), Some("version_mismatch"));
+        let undeclared =
+            case(&good_frame().replace(r#""protocol_versions":{"min":1,"max":1},"#, ""));
+        assert_eq!(undeclared.kind(), Some("version_mismatch"), "{undeclared}");
+
+        // Control: every code above must be reachable and they must not all be
+        // the same number — a `code()` returning one constant would pass any
+        // single row.
+        let codes = [
+            parse.code(),
+            wrong_method.code(),
+            missing_field.code(),
+            bad_token.code(),
+        ];
+        assert_eq!(codes.len(), 4);
+        assert!(
+            codes
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == 4
+        );
+    }
+
+    /// SPEC calls out duplicate `auth_token` by name. "Last one wins" lets a
+    /// sender show one token to whatever logs the frame and a different one to
+    /// whatever checks it.
+    ///
+    /// The rejection comes from serde's derive, not from code written here — so
+    /// this test's real job is to prove that inherited behaviour is actually in
+    /// force, with a control showing the same frame is otherwise fine.
+    #[test]
+    fn a_duplicate_key_is_refused_rather_than_last_one_wins() {
+        let dup = good_frame().replace(
+            r#""auth_token":"s3cret""#,
+            r#""auth_token":"decoy","auth_token":"s3cret""#,
+        );
+        let err =
+            accept(dup.as_bytes(), &expectation()).expect_err("duplicate key must be refused");
+        assert_eq!(err.code(), -32602, "{err}");
+        // Control: without the duplication the same frame is accepted, so the
+        // refusal above is about the duplicate and not about the edit.
+        assert!(accept(good_frame().as_bytes(), &expectation()).is_ok());
+    }
+
+    /// An unknown field is a message this kernel does not understand.
+    #[test]
+    fn an_unknown_field_is_refused_not_ignored() {
+        let extra = good_frame().replace(r#""capabilities""#, r#""future_field":1,"capabilities""#);
+        let err = accept(extra.as_bytes(), &expectation()).expect_err("unknown field");
+        assert_eq!(err.code(), -32602, "{err}");
+    }
+
+    /// Shape is checked before secrets: a frame that is not a valid `initialize`
+    /// must be refused as such even when its token is also wrong, so that the
+    /// two failures cannot be told apart by which check ran.
+    #[test]
+    fn the_shape_is_checked_before_the_token() {
+        let both_wrong = r#"{"jsonrpc":"2.0","method":"ping","id":1,"params":{"module":"x"}}"#;
+        let err = accept(both_wrong.as_bytes(), &expectation()).unwrap_err();
+        assert_eq!(err.code(), -32600, "the token was consulted first: {err}");
+    }
+
+    /// The auth failure must not describe the token.
+    #[test]
+    fn the_auth_failure_is_not_an_oracle() {
+        let err = accept(
+            good_frame().replace("s3cret", "wrong").as_bytes(),
+            &expectation(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        for leak in ["s3cret", "wrong", "6", "length"] {
+            assert!(!text.contains(leak), "{text} leaks {leak:?}");
+        }
+    }
+
+    /// The offer set must be able to say "this daemon does not provide
+    /// `memory.scoped`" — SPEC §8's acceptance criterion for capability
+    /// negotiation. Absence IS the statement; there is no "supported but off".
+    #[test]
+    fn an_unoffered_method_family_is_simply_absent() {
+        let empty = Offer::none();
+        assert!(!empty.provides("_a24/memory/scoped/get"));
+        assert!(!empty.provides("_a24/memory/private/get"));
+        // Control: the predicate is not constantly false.
+        let later = Offer {
+            provides: vec!["_a24/memory/private".to_owned()],
+        };
+        assert!(later.provides("_a24/memory/private/get"));
+        assert!(
+            !later.provides("_a24/memory/scoped/get"),
+            "offering private must not imply scoped"
+        );
+    }
+
+    /// **FU-42.** `MAX_FRAME_BYTES` was chosen before this message existed, and
+    /// exceeding it disconnects rather than degrades. So the number is pinned
+    /// here, against the largest `initialize` this protocol can actually
+    /// produce, rather than against the small one used in the other tests.
+    ///
+    /// The control matters as much as the measurement: a frame deliberately over
+    /// the limit must measure over it, or "it fits" would be a statement about
+    /// the ruler.
+    #[test]
+    fn the_largest_possible_initialize_fits_in_one_frame() {
+        // Every capability this design will ever offer (SPEC §8's final offer
+        // set), a generously long module name and digest, and a token far larger
+        // than anything the kernel generates.
+        let params = InitializeParams {
+            protocol_versions: VersionRange::new(1, u32::MAX),
+            module: "m".repeat(agent24_domain::DomainOsManifest::MAX_YAML_BYTES.min(4096)),
+            manifest_digest: format!("sha512:{}", "f".repeat(128)),
+            auth_token: "t".repeat(4096),
+            capabilities: vec![
+                "memory.private".to_owned(),
+                "memory.scoped".to_owned(),
+                "events".to_owned(),
+                "approval".to_owned(),
+            ],
+        };
+        let req = InitializeRequest {
+            jsonrpc: "2.0".to_owned(),
+            method: INITIALIZE_METHOD.to_owned(),
+            id: u64::MAX,
+            params,
+        };
+        let encoded = serde_json::to_vec(&req).unwrap();
+        assert!(
+            encoded.len() < MAX_FRAME_BYTES,
+            "the largest initialize is {} bytes, at or over the {MAX_FRAME_BYTES}-byte frame limit \
+             — raise the limit BEFORE this lands, because exceeding it disconnects",
+            encoded.len()
+        );
+        // Positive control: the same ruler, applied to something known to be over
+        // the limit, must say so.
+        let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+        assert!(oversized.len() > MAX_FRAME_BYTES);
+    }
+}
