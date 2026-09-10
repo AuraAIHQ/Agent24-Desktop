@@ -439,7 +439,8 @@ mod tests {
         format!(
             "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
              event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
-             kernel_capabilities: [events]\nimpl_kind: out_of_process_provider\n"
+             kernel_capabilities: [events]\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/{name}\n"
         )
     }
 
