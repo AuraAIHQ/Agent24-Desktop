@@ -1553,7 +1553,7 @@ mod tests {
             upstream,
             Limits {
                 total: Duration::from_secs(5),
-                head: Duration::from_millis(80),
+                head: Duration::from_millis(500),
             },
             8,
         ))
@@ -1571,6 +1571,13 @@ mod tests {
             "the message named the wrong deadline: {}",
             got.body
         );
+        // This is the `head < total` HALF of the min(). Its twin below is
+        // `total < head`, and NEITHER alone pins the min: with only that one,
+        // `head_budget = total` stays green; with only this one,
+        // `head_budget = head` stays green. A rule with two sides needs a case
+        // on each side.
+        assert!(got.body.contains("0.5s"), "{}", got.body);
+        assert!(!got.body.contains("5.0s"), "{}", got.body);
     }
 
     #[tokio::test]
@@ -1866,10 +1873,17 @@ mod tests {
         // would claim "within 5.0s" about something that gave up after one, and
         // a message naming the wrong limit sends the reader to the wrong knob.
         //
-        // The existing head-timeout test could not catch that: it asserts the
-        // PHRASE, and the phrase is the same either way. Mutating only the
-        // NUMBER left it green — which is how a mutation can go red for the
-        // wrong reason and still look like coverage.
+        // The first version of this test asserted only the PHRASE, and the
+        // phrase is the same either way — mutating only the NUMBER left it
+        // green, which is how a mutation goes red for the wrong reason and
+        // still looks like coverage.
+        //
+        // The second version asserted the number but only on THIS side of the
+        // min: `head_budget = state.limits.total` also prints 1.0s here. The
+        // other side lives in `a_module_that_never_answers_is_a_504_not_a_502`,
+        // and a third case below covers the part neither of them reaches — a
+        // budget that is neither constant, because the client already spent
+        // some of the total.
         let upstream = raw_upstream("silence").await;
         let proxy = serve(proxy_with(
             upstream,
@@ -1891,5 +1905,68 @@ mod tests {
             got.body
         );
         assert!(!got.body.contains("5.0s"), "{}", got.body);
+    }
+
+    #[tokio::test]
+    async fn the_head_budget_is_what_is_left_of_the_total_not_a_constant() {
+        // The part neither side of the min() reaches. Both other cases would
+        // still pass if the budget were `min(total, head)` computed ONCE, but
+        // that is not what §2.1 says: the total starts at the client's body, so
+        // by the time the module is dialled some of it is already spent.
+        //
+        // Here the client takes ~800ms of a 2s total before its body is
+        // complete, so the module's head budget is what remains — about 1.2s —
+        // and never the 2s a constant would print.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = raw_upstream("silence").await;
+        let proxy = serve(proxy_with(
+            upstream,
+            Limits {
+                total: Duration::from_secs(2),
+                head: Duration::from_secs(5),
+            },
+            8,
+        ))
+        .await;
+
+        let started = std::time::Instant::now();
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                // `Connection: close` so the reply ends at EOF: with a
+                // COMPLETE body hyper keeps the connection alive, and
+                // `read_to_end` would wait for a second request that never
+                // comes. (The stalled-client test above needs no such header —
+                // an undrained body ends the connection by itself.)
+                format!(
+                    "POST {NS}/slow-upload HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 4\r\n\r\nab"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        client.write_all(b"cd").await.unwrap();
+
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut reply))
+            .await
+            .expect("the request never ended")
+            .unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+
+        assert!(reply.contains("504"), "{reply}");
+        assert!(reply.contains("did not begin answering"), "{reply}");
+        // Not the head constant, and not the whole total either.
+        assert!(
+            !reply.contains("5.0s"),
+            "the head constant was reported: {reply}"
+        );
+        assert!(
+            !reply.contains("2.0s"),
+            "the budget was the whole total, ignoring what the client spent: {reply}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
