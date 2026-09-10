@@ -66,6 +66,11 @@ pub const REQUEST_ID_HEADER: &str = "x-a24-request-id";
 /// directions — see the module docs.
 pub const A24_HEADER_PREFIX: &str = "x-a24-";
 
+/// The proxy-provenance family, stripped inbound as a whole.
+///
+/// See [`strips_from_request`] for why a prefix is right here and a list is not.
+pub const X_FORWARDED_PREFIX: &str = "x-forwarded-";
+
 /// Total time one proxied request may take — reading the CLIENT's body through
 /// the module's last byte.
 ///
@@ -124,6 +129,21 @@ fn is_hop_by_hop_or_recomputed(name: &str) -> bool {
 pub fn strips_from_request(name: &str) -> bool {
     is_hop_by_hop_or_recomputed(name)
         || name.starts_with(A24_HEADER_PREFIX)
+        // The whole `x-forwarded-` family, by PREFIX rather than by name.
+        //
+        // This file's own argument is that a prefix keeps up on its own and a
+        // list does not — and it applies here too. A list of the obvious three
+        // misses `X-Forwarded-Ssl` and `-Scheme` (Rack reads both for
+        // `Request#ssl?`, so a module would believe the connection was TLS) and
+        // `-Port` (Symfony's trusted-proxy path builds links from it).
+        //
+        // The prefix is safe here in a way a broad denylist would not be, and
+        // THAT is the part worth writing down: **the kernel is the only hop**,
+        // so no legitimate `x-forwarded-*` can exist on a request reaching a
+        // module. There is nothing for the prefix to over-catch. The cost is the
+        // same one `X-A24-*` carries — a module must not name its own header
+        // `x-forwarded-something` — and that is a rule a person can follow.
+        || name.starts_with(X_FORWARDED_PREFIX)
         || matches!(
             name,
             // Kernel credentials. The whole reason this file exists.
@@ -142,9 +162,6 @@ pub fn strips_from_request(name: &str) -> bool {
             // asked for it, and minting a header no module reads is inventing a
             // contract (FU-45).
             | "forwarded"
-            | "x-forwarded-for"
-            | "x-forwarded-host"
-            | "x-forwarded-proto"
             | "x-real-ip"
         )
 }
@@ -2073,9 +2090,17 @@ mod tests {
                 ("x-forwarded-proto", "https"),
                 ("x-real-ip", "1.2.3.4"),
                 ("forwarded", "for=1.2.3.4"),
-                // Positive control: a header with a similar shape survives, so
-                // this is not a prefix sweep.
-                ("x-forwarded-by-nobody", "kept"),
+                // The three that a list of the obvious ones misses: Rack reads
+                // the first two for `Request#ssl?`, Symfony builds links from
+                // the third.
+                ("x-forwarded-ssl", "on"),
+                ("x-forwarded-scheme", "https"),
+                ("x-forwarded-port", "443"),
+                // Positive control — and it has to sit OUTSIDE the prefix now,
+                // because the whole `x-forwarded-` family is stripped on
+                // purpose: the kernel is the only hop, so none of that family
+                // can be legitimate here.
+                ("x-module-own-header", "kept"),
             ],
             "",
         )
@@ -2085,6 +2110,9 @@ mod tests {
             "x-forwarded-for",
             "x-forwarded-host",
             "x-forwarded-proto",
+            "x-forwarded-ssl",
+            "x-forwarded-scheme",
+            "x-forwarded-port",
             "x-real-ip",
             "forwarded",
         ] {
@@ -2093,7 +2121,7 @@ mod tests {
                 "{gone} reached the module"
             );
         }
-        assert_eq!(seen["headers"]["x-forwarded-by-nobody"], "kept");
+        assert_eq!(seen["headers"]["x-module-own-header"], "kept");
     }
 
     #[tokio::test]
