@@ -340,9 +340,22 @@ mod tests {
         assert_eq!(parse.kind(), None);
 
         // SPEC: 「**首帧不是 `initialize`** → `-32600` 断连」
+        //
+        // TWO frames, because there are two paths to this code and only one of
+        // them was covered. This frame's params are incomplete, so it fails
+        // strict deserialisation and is classified by `classify()` — it never
+        // reaches the `method` check inside `accept`. Measured (review): with
+        // only this row, deleting that check left the whole suite green.
         let wrong_method =
             case(r#"{"jsonrpc":"2.0","method":"ping","id":1,"params":{"module":"cos72"}}"#);
         assert_eq!(wrong_method.code(), -32600, "{wrong_method}");
+        // …and the frame that DOES reach it: valid everything, wrong method.
+        let wrong_method_complete = case(&good_frame().replace("\"initialize\"", "\"ping\""));
+        assert_eq!(
+            wrong_method_complete.code(),
+            -32600,
+            "a fully-formed frame with the wrong method was accepted: {wrong_method_complete}"
+        );
 
         // SPEC: 「首帧 params 解析失败（含重复 `auth_token` 等重复 JSON key）→
         //        `-32602` 并断连」
@@ -475,8 +488,20 @@ mod tests {
         // than anything the kernel generates.
         let params = InitializeParams {
             protocol_versions: VersionRange::new(1, u32::MAX),
-            module: "m".repeat(agent24_domain::DomainOsManifest::MAX_YAML_BYTES.min(4096)),
+            // The real bound, not a guessed one: `valid_name` enforces
+            // `MAX_NAME_BYTES`. The first version used
+            // `MAX_YAML_BYTES.min(4096)` — 64× too large, and mixing two
+            // different quantities (a whole document's cap vs one name's).
+            // Over-wide is safe in DIRECTION but bites later: the slack it eats
+            // is slack that does not exist, so a future field could turn this
+            // red over a module name that can never occur, and the next person
+            // would edit the test.
+            module: "m".repeat(agent24_domain::MAX_NAME_BYTES),
             manifest_digest: format!("sha512:{}", "f".repeat(128)),
+            // ASSUMPTION, not a measurement: the kernel's token generator does
+            // not exist yet (see FU-44). Replace this with the real bound when
+            // 3b-3 lands. A number labelled as an assumption and a number that
+            // looks like a reading cost very different amounts to be wrong about.
             auth_token: "t".repeat(4096),
             capabilities: vec![
                 "memory.private".to_owned(),
