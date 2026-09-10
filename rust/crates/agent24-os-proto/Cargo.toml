@@ -8,6 +8,8 @@ description = "Agent24 kernel↔domain-OS protocol (ME-3b): version negotiation,
 
 [dependencies]
 agent24-domain = { path = "../agent24-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

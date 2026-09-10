@@ -74,6 +74,43 @@ impl VersionRange {
     }
 }
 
+/// Serialised as `{"min":m,"max":n}`.
+impl serde::Serialize for VersionRange {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("VersionRange", 2)?;
+        st.serialize_field("min", &self.min)?;
+        st.serialize_field("max", &self.max)?;
+        st.end()
+    }
+}
+
+/// Deserialised **through [`VersionRange::new`]**, not straight into the fields.
+///
+/// `#[derive(Deserialize)]` would have written directly to `min` and `max`,
+/// which means a peer could put an inverted range on the wire and get a value
+/// that `new` refuses to construct in this process. The private fields and the
+/// checked constructor would then be a rule that holds everywhere except at the
+/// one place the value comes from someone else — which is the only place it
+/// matters.
+impl<'de> serde::Deserialize<'de> for VersionRange {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            min: u32,
+            max: u32,
+        }
+        let w = Wire::deserialize(d)?;
+        VersionRange::new(w.min, w.max).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "inverted protocol version range [{}, {}]",
+                w.min, w.max
+            ))
+        })
+    }
+}
+
 impl fmt::Display for VersionRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}, {}]", self.min, self.max)
@@ -327,6 +364,22 @@ mod tests {
             "KIND is {:?}, which is a numeric CODE, not an `error.data.kind`",
             VersionMismatch::KIND
         );
+    }
+
+    /// The constructor's rule has to survive the wire, because the wire is the
+    /// only place the value comes from someone else.
+    #[test]
+    fn an_inverted_range_cannot_arrive_over_the_wire_either() {
+        let bad: Result<VersionRange, _> = serde_json::from_str(r#"{"min":3,"max":1}"#);
+        assert!(bad.is_err(), "an inverted range deserialised: {bad:?}");
+        // Control: the same shape with a legal range must work, or the assertion
+        // above is satisfied by the format being wrong rather than the range.
+        let good: VersionRange = serde_json::from_str(r#"{"min":1,"max":3}"#).unwrap();
+        assert_eq!(good, r(1, 3));
+        // And it round-trips, so the kernel's echo of the chosen range is the
+        // same shape the module sent.
+        let text = serde_json::to_string(&good).unwrap();
+        assert_eq!(serde_json::from_str::<VersionRange>(&text).unwrap(), good);
     }
 
     #[test]

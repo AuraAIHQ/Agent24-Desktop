@@ -128,6 +128,8 @@ name = "agent24-os-proto"
 version = "0.3.0"
 dependencies = [
  "agent24-domain",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
