@@ -420,13 +420,23 @@ mod tests {
                             hit
                         }
                     };
-                    // HOME is not ours to forward: launchd sets it itself.
+                    // Two names are handled elsewhere and must not be demanded
+                    // of `PASSTHROUGH_VARS`:
+                    //
+                    // - HOME: launchd sets it itself.
+                    // - PATH: captured separately in `snapshot_env` because it
+                    //   needs the LOGIN shell's value rather than whatever the
+                    //   daemon happens to have. It IS forwarded — just not
+                    //   through this list. A scanner that did not know that
+                    //   reported it the moment ME-3b-3's `which()` began reading
+                    //   PATH on the daemon side: the READING was right, the
+                    //   conclusion would have been wrong.
                     if let Some(name) = name {
                         let shouty = !name.is_empty()
                             && name
                                 .chars()
                                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-                        if shouty && name != "HOME" {
+                        if shouty && !matches!(name.as_str(), "HOME" | "PATH") {
                             found.push(name);
                         }
                     }

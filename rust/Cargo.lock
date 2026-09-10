@@ -130,6 +130,7 @@ dependencies = [
  "agent24-domain",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

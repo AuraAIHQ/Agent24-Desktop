@@ -294,9 +294,15 @@ impl SpawnCommand {
     ///
     /// Neither gives an attacker anything new — whoever can write the manifest
     /// can write the package directory too. What they take away is the BENEFIT
-    /// this rule was said to provide. The load-bearing check belongs where the
-    /// program is actually started (ME-3b-3): canonicalise, and refuse anything
-    /// that no longer lies under the package root.
+    /// this rule was said to provide.
+    ///
+    /// **The load-bearing check lives in `agent24_os_proto::launch::resolve`**,
+    /// where the path is real: a relative command is canonicalised and must still
+    /// lie under the canonicalised package directory, so `bin/node` pointing at
+    /// `/bin/sh` is refused there. Named here rather than described as a future
+    /// requirement — a cross-module requirement that lives only in the
+    /// docstring of the module that cannot enforce it is a requirement nobody is
+    /// holding.
     ///
     /// # Errors
     ///
