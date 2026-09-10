@@ -32,12 +32,18 @@
 //! # Not in this slice
 //!
 //! No subprocess: the upstream is an address, so this whole slice is testable
-//! against a mock and lands independently of ME-3b-3. Concurrency limits and
-//! backpressure (§5) need the supervisor that owns the module's lifetime, and
-//! the `X-A24-Approval-Token` / `X-A24-Request-Lease` injections need ME-3e and
-//! a lease table that does not exist. What IS here for those two is the
-//! stripping: they can never arrive from a client, and can never leave through a
-//! module, before either is ever minted.
+//! against a mock and lands independently of ME-3b-3. The
+//! `X-A24-Approval-Token` / `X-A24-Request-Lease` injections need ME-3e and a
+//! lease table that does not exist; what IS here for those two is the stripping,
+//! so they can never arrive from a client and can never leave through a module,
+//! before either is ever minted.
+//!
+//! The concurrency ceiling and both deadlines (§5) ARE here, and deliberately —
+//! an earlier draft of this comment deferred them to the supervisor. They do not
+//! need one: nothing about "how many requests may this module be handling"
+//! needs to know when the process started. What DOES need the supervisor is
+//! DRAINING (§4, ME-3b-5), which is why 503 carries a `code` rather than a
+//! single meaning.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -478,7 +484,7 @@ async fn proxy(
 
     // Refused rather than queued: a queue is memory the caller controls, which
     // is the thing being bounded.
-    let Ok(_permit) = state.inflight.clone().try_acquire_owned() else {
+    let Ok(permit) = state.inflight.clone().try_acquire_owned() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "module_overloaded",
@@ -492,7 +498,7 @@ async fn proxy(
     // Read the body under the kernel's own cap: a module must not be the thing
     // that decides how much of the daemon's memory an upload gets.
     let body = match tokio::time::timeout_at(deadline, read_body_or_response(request)).await {
-        Err(_) => return timed_out(&state),
+        Err(_) => return timed_out(&state, TimedOut::ClientBody),
         Ok(Err(response)) => return response,
         Ok(Ok(b)) => b,
     };
@@ -551,7 +557,7 @@ async fn proxy(
     )
     .await
     {
-        Err(_) => return timed_out(&state),
+        Err(_) => return timed_out(&state, TimedOut::UpstreamHead),
         Ok(Err(e)) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -579,7 +585,7 @@ async fn proxy(
     )
     .await
     {
-        Err(_) => return timed_out(&state),
+        Err(_) => return timed_out(&state, TimedOut::UpstreamBody),
         Ok(Ok(c)) => c.to_bytes(),
         Ok(Err(e)) => {
             return if is_length_limit(&*e) {
@@ -602,21 +608,77 @@ async fn proxy(
         }
     };
 
-    let mut response = Response::new(Body::from(collected));
+    // The permit rides with the BODY, not with this function.
+    //
+    // Dropping it at `return` bounds how many requests are being handled, which
+    // is not the thing §2.1 says it bounds: the collected bytes are still held
+    // while hyper writes them to a client that may be reading slowly, or not at
+    // all. With the permit released there, a thousand slow readers each hold a
+    // megabyte and the ceiling has counted none of them.
+    let mut response = Response::new(Body::new(PermitBody {
+        data: Some(collected),
+        _permit: permit,
+    }));
     *response.status_mut() = parts.status;
     *response.headers_mut() = sanitize_response_headers(&parts.headers);
     response.into_response()
 }
 
-fn timed_out(state: &ProxyState) -> Response {
-    error_response(
-        StatusCode::GATEWAY_TIMEOUT,
-        "upstream_timeout",
-        &format!(
-            "the module did not answer within {}s",
+/// A one-frame body that holds a concurrency permit until it is dropped.
+struct PermitBody {
+    data: Option<Bytes>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl hyper::body::Body for PermitBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(
+            self.get_mut()
+                .data
+                .take()
+                .map(|b| Ok(hyper::body::Frame::data(b))),
+        )
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.data.as_ref().map_or(0, Bytes::len) as u64)
+    }
+}
+
+/// Which deadline expired. §2.1 says the two answer different questions, so one
+/// shared message makes the answer unreadable — it names the wrong limit and,
+/// for a stalled client, blames the wrong party.
+enum TimedOut {
+    /// The client never finished sending its request.
+    ClientBody,
+    /// The module accepted the request and produced no response head.
+    UpstreamHead,
+    /// The module started answering and did not finish.
+    UpstreamBody,
+}
+
+fn timed_out(state: &ProxyState, which: TimedOut) -> Response {
+    let message = match which {
+        TimedOut::ClientBody => format!(
+            "the request body was not received within {}s",
             state.limits.total.as_secs()
         ),
-    )
+        TimedOut::UpstreamHead => format!(
+            "the module did not begin answering within {}s",
+            state.limits.head.as_secs()
+        ),
+        TimedOut::UpstreamBody => format!(
+            "the module did not finish answering within {}s",
+            state.limits.total.as_secs()
+        ),
+    };
+    error_response(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", &message)
 }
 
 fn is_length_limit(e: &(dyn std::error::Error + 'static)) -> bool {
@@ -650,14 +712,19 @@ fn head_refusal(
             "protocol upgrades (WebSocket) are not proxied this round",
         ));
     }
-    // EVERY content-type value, case-insensitively. `Text/Event-Stream` is the
-    // same media type as `text/event-stream`, and a module that sends two
-    // content-types is not one whose first value should decide the question.
+    // EVERY content-type value, and the MEDIA TYPE of each rather than a prefix
+    // of the header. `Text/Event-Stream` is the same media type as
+    // `text/event-stream`; `text/event-streaming` is a different one, and
+    // refusing a legitimate response is as much a bug as forwarding a stream. A
+    // module that sends two content-types is not one whose first value should
+    // decide the question either.
     if parts.headers.get_all(header::CONTENT_TYPE).iter().any(|v| {
         v.to_str().is_ok_and(|v| {
-            v.trim_start()
-                .to_ascii_lowercase()
-                .starts_with("text/event-stream")
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
         })
     }) {
         return Some(error_response(
@@ -1302,6 +1369,14 @@ mod tests {
                     match script {
                         // Accept, say nothing, hold the connection open.
                         "silence" => std::future::pending::<()>().await,
+                        "finite-chunked" => {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n",
+                                )
+                                .await;
+                            let _ = socket.shutdown().await;
+                        }
                         "endless-sse" => {
                             let _ = socket
                                 .write_all(
@@ -1404,9 +1479,19 @@ mod tests {
             8,
         ))
         .await;
+        let started = std::time::Instant::now();
         let got = call(proxy, Method::GET, &format!("{NS}/anything"), &[], "").await;
         assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
         assert!(got.body.contains("upstream_timeout"), "{}", got.body);
+        // It was the HEAD deadline that fired, not the total one. Without this,
+        // deleting the head deadline entirely leaves the test green — it just
+        // passes five seconds later.
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            got.body.contains("did not begin answering"),
+            "the message named the wrong deadline: {}",
+            got.body
+        );
     }
 
     #[tokio::test]
@@ -1446,5 +1531,163 @@ mod tests {
         let after = call(proxy, Method::GET, &format!("{NS}/third"), &[], "").await;
         assert_eq!(after.status, StatusCode::GATEWAY_TIMEOUT);
         assert!(after.body.contains("upstream_timeout"), "{}", after.body);
+    }
+
+    #[tokio::test]
+    async fn the_handler_holds_its_permit_until_the_response_body_is_dropped() {
+        // The claim §2.1 makes is about MEMORY, not about handler count: the
+        // collected bytes are still held while hyper writes them to a client
+        // that may be reading slowly, or not at all. Release the permit when the
+        // handler returns and the ceiling has counted none of that.
+        //
+        // Driven through the router rather than a socket, and observed on the
+        // semaphore rather than on bytes: "enough bytes to fill a kernel write
+        // buffer" is a number that differs per OS, so a socket-pressure test
+        // would measure the OS. And it has to go through the HANDLER — an
+        // earlier version of this test built a `PermitBody` directly, which
+        // proved the type works while staying green with the handler wired the
+        // old way. It tested the tool, not the call site.
+        use tower::ServiceExt;
+
+        let hits = Hits::default();
+        let upstream = serve(Router::new().fallback(upstream_handler).with_state(hits)).await;
+        let state = state_with(NS, upstream, Limits::default(), 1);
+        let sem = state.inflight.clone();
+        let app = Router::new().fallback(proxy).with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{NS}/echo"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The handler has returned. The bytes have not gone anywhere.
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the permit was released while the response body was still held"
+        );
+        drop(response);
+        assert_eq!(sem.available_permits(), 1, "the permit outlived its body");
+    }
+
+    #[test]
+    fn a_media_type_that_merely_starts_the_same_is_not_an_event_stream() {
+        // The control on the SSE refusal: without it, "refuses event streams" is
+        // also satisfied by refusing anything whose content-type starts with
+        // those characters.
+        for (ct, refused) in [
+            ("text/event-stream", true),
+            ("text/event-stream; charset=utf-8", true),
+            ("Text/Event-Stream", true),
+            ("text/event-streaming", false),
+            ("application/json", false),
+        ] {
+            let mut parts = Response::new(()).into_parts().0;
+            parts
+                .headers
+                .insert(header::CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+            let got = head_refusal(NS, "/api/v1/zzmock/x", &parts).is_some();
+            assert_eq!(got, refused, "{ct}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_finishes_its_body_times_out_holding_a_permit() {
+        // Two claims in one, both of which the earlier tests left ever-green
+        // because every one of them sent a body that completed instantly:
+        //
+        //   1. the total deadline starts at the CLIENT's body, not at the
+        //      upstream call — otherwise a dribbling uploader is invisible to it;
+        //   2. the permit is taken before that read, so a stalled uploader
+        //      occupies the ceiling rather than slipping under it.
+        use tokio::io::AsyncWriteExt;
+
+        // The upstream answers instantly, so nothing here can be blamed on it.
+        let hits = Hits::default();
+        let upstream = serve(
+            Router::new()
+                .fallback(upstream_handler)
+                .with_state(hits.clone()),
+        )
+        .await;
+        let proxy = serve(proxy_with(
+            upstream,
+            Limits {
+                total: Duration::from_millis(300),
+                head: Duration::from_secs(5),
+            },
+            1,
+        ))
+        .await;
+
+        // Promise 50 bytes, send 3, stall.
+        let mut stalled = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        stalled
+            .write_all(
+                format!("POST {NS}/upload HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\nabc")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // While it stalls, the one permit is taken.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let refused = call(proxy, Method::GET, &format!("{NS}/other"), &[], "").await;
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            refused.body.contains("module_overloaded"),
+            "{}",
+            refused.body
+        );
+
+        // And the stalled request ends at the deadline, blaming the right party.
+        let mut reply = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stalled, &mut reply),
+        )
+        .await
+        .expect("the stalled request never ended")
+        .unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.contains("504"), "{reply}");
+        assert!(
+            reply.contains("request body was not received"),
+            "the timeout blamed the module for a client that stalled: {reply}"
+        );
+
+        // The module was never dialled for a request whose body never arrived.
+        assert_eq!(hits.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_finite_chunked_response_is_buffered_and_passed_on() {
+        // §9 says "SSE / chunked / WebSocket 本轮拒绝". Read literally that
+        // refuses this response, and this response is fine: it is finite, it is
+        // under the cap, and it is already being buffered rather than streamed.
+        //
+        // The distinction §2.1 now records: `text/event-stream` DECLARES that a
+        // response is a stream, so a module sending one can be told plainly that
+        // it cannot. `Transfer-Encoding: chunked` declares nothing — it is how
+        // an ordinary server sends a body whose length it did not compute in
+        // advance. Refusing it buys literal compliance and costs working modules.
+        //
+        // An ENDLESS chunked body with no SSE content-type is the case this
+        // leaves: it is stopped by the 1 MiB cap or the total deadline, not at
+        // the head. That is written down in §2.1 rather than hidden here.
+        let upstream = raw_upstream("finite-chunked").await;
+        let proxy = serve(proxy_with(upstream, Limits::default(), 8)).await;
+        let got = call(proxy, Method::GET, &format!("{NS}/thing"), &[], "").await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(got.body, "hello world");
+        // And it did NOT reach the client as chunked — the proxy rebuilt the
+        // framing, so the hop-by-hop header is gone.
+        assert!(!got.headers.contains_key(header::TRANSFER_ENCODING));
     }
 }
