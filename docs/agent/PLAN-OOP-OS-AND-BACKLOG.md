@@ -151,7 +151,43 @@ FU-12 frecency 排序、FU-13 模型权重 lockfile、FU-15 建 `docs/laws/`、F
 | ID | 内容 | 为什么必须在前 |
 |---|---|---|
 | ~~T0.1~~ | ~~把 3d 挪到 3f 之后~~ | **已作废（用户 2026-09-10 裁决）**：「ME-3 都给我先完成」+「内核记忆未来可能需要」→ **3d 留在 v0.5.0 范围内，按依赖顺序做，不重排。** 少了一次切法评审，也少了一条 SPEC 修改 |
-| **T0.2** | **决定模块侧怎么被"照着写"**：给 SDK crate，还是只给 wire 文档 + 参考实现？ | 【判断】**SPEC §8 今天没有这一项** —— 3f 只交付一个 mock provider 包。「第三方照模板写自己的」这句话要成立，必须有其一。不定，模板就无法真的被照抄 |
+| ~~T0.2~~ | **已裁决（用户 2026-09-10）：两个都要。** ① Rust SDK crate（`agent24-os-sdk`），②完整 wire 文档 + 参考实现 | 【实测】SPEC §8 原本两样都没有，只有 3f 的一个 mock provider 包 —— 而 mock 是用来证明内核这侧能装的，不是用来给别人照抄的 |
+
+### T0.2 裁决之后新增的两项
+
+| ID | 任务 | 依赖 | 验收 |
+|---|---|---|---|
+| **T13** | `agent24-os-sdk` crate：模块侧把 framing + `initialize` + 回调通道包起来，写一个 OS 只需实现业务 trait | T6 | Cos72 用它写成，**且 SDK 自己不重复实现协议** —— 它只能调 `agent24-os-proto`；判据：SDK 里出现 `serde_json::from_slice` 直接解析协议帧 = 缝切错了 |
+| **T14** | **wire 文档 + 非 Rust 参考实现** | T13 | 【判断】判据是**「不看 SDK 源码能不能写出来」**：拿文档写一个最小 Node.js 模块并通过 3f 的黑盒。只有这条能证明文档是完整的 —— 用 Rust 再写一个只会证明 SDK 好用 |
+
+---
+
+## 六、能装 Node.js 写的 OS 吗 —— 设计上可以，但今天缺一个字段
+
+【判断】边界是**一个进程 + 一份 wire 协议**，没有任何一处是 Rust 特有的：内核 spawn 一个子进程、按 `/api/v1/<ns>/*` 把 HTTP 原样代理给它、用 NDJSON over UDS 走回调。模块用什么语言写，内核看不见也不该看见。
+
+【实测】**但今天没有任何地方能说出"怎么启动它"。** `RawManifest` 的 13 个字段（`rust/crates/agent24-domain/src/lib.rs`）里没有 spawn 命令：
+
+```
+name / version / route_namespace / event_module / data_dir /
+requires_models / requires_apis / requires_deps / kernel_capabilities /
+ui_entry / impl_kind / manifest_version / min_daemon_protocol
+```
+
+SPEC 的 ME-3a 那行写了「manifest 支持 `impl_kind: out-of-process` **+ spawn 命令**」，**后半没实现** —— ME-3a 交付的是发现、安装与门 6。
+
+**所以 T3（3b-3 spawn + 监督）的第一件事是给 manifest 加这个字段**，而它的形状直接决定 Node.js 能不能装：
+
+- 只允许一个可执行文件路径 → Node 模块要自带一个 wrapper 脚本
+- 允许 `command + args`（如 `node`, `["server.js"]`）→ Node/Python/任何语言直接可写
+
+【判断】**取后者**，理由不是灵活性，是前者会把「用什么语言写」变成一件需要绕过去的事，而绕法（wrapper 脚本）比字段本身更难审。
+
+### 这个字段是执行边界，所以 FU-41 必须在它之前闭
+
+manifest 里一旦能指名一个要执行的程序，**谁能写这个 manifest 就等于谁能让 daemon 执行任意命令**。FU-41（ephemeral packages root 没有所有权/权限校验）今天的代价只是「污染拒绝列表」，加上这个字段之后就是执行边界 —— 台账里已经写明「不要用『路径不可猜』当作已修」。
+
+
 
 ### 主链
 
