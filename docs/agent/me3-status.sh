@@ -27,33 +27,88 @@
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 
-# 行首锚定：`^[[:space:]]*<符号>` —— 一个定义在行首（可缩进），
-# 一句 `// TODO: 将来会有 pub fn accept` 不在行首。
-probe() { # probe <描述> <文件> <符号>
-  local desc=$1 file=$2 sym=$3
-  if [ ! -f "$file" ] || ! grep -qE "^[[:space:]]*${sym}\b" "$file" 2>/dev/null; then
-    echo "  ○ 未开工   $desc"; return 1
-  fi
-  echo "  ● 已在 main $desc"; return 0
+# ── 它读的是 main，因为读者问的是关于 main 的问题 ──────────────────
+#
+# 第三处「它报的坐标不是它量的坐标」，而且这一处不是构造出来的：上一版行标签写
+# `● 已在 main`，而 grep 读的是**脚本所在的那棵树**。在任何一棵落后于 main 的树
+# 上跑它，答案都是错的，**而且是以「关于 main」的口吻说出来的** —— 复审在
+# #165 自己的分支上跑，两刀已交付的工作被报成「未开工」。
+#
+# 失效方向和最初那张手写表一模一样：说「未开工」而其实已交付 → 有人去重做一件
+# 已完成的事。**那句话就写在这个脚本的注释里。**
+#
+# 两条路：把标签改成「这棵树上有/没有」（最省），或者真去读 main。取后者，因为
+# 读者要回答的是「我该不该写这一刀」—— 那是关于 main 的问题，改标签只是把问题
+# 让给读者。
+#
+# 代价如实写：读的是 `origin/main`，也就是**最后一次 fetch 的状态**，不是此刻的
+# 远端。所以表头报它的 sha 和它有多旧；取不到这个 ref 时**明确报错，不当作
+# 「没有」** —— 那正是这一整族缺陷的形状。
+#
+# 行首锚定：`^[[:space:]]*<符号>` —— 一个定义在行首（可缩进），一句
+# `// TODO: 将来会有 pub fn accept` 不在行首。
+has_symbol() { # has_symbol <内容来源命令...> <符号>  —— 从 stdin 读内容
+  grep -qE "^[[:space:]]*$1\b"
 }
 
-# 坐标：探针读的是**工作树**，不是 HEAD。第一版打印 `git rev-parse HEAD` 当
-# 坐标，于是一个未提交的新文件会让某一行翻成 ●，而表头仍写着那个 commit ——
-# **它报的坐标不是它量的坐标**，正是这整件事要修的那一类。
-coord=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-  coord="${coord} (+未提交改动：读的是工作树，不是这个 commit)"
+REF=${ME3_REF:-origin/main}
+
+probe() { # probe <描述> <文件> <符号>
+  local desc=$1 file=$2 sym=$3 on_ref=1 on_tree=1
+  git show "$REF:$file" 2>/dev/null | has_symbol "$sym" && on_ref=0
+  [ -f "$file" ] && grep -qE "^[[:space:]]*${sym}\b" "$file" 2>/dev/null && on_tree=0
+
+  if [ $on_ref -eq 0 ]; then
+    # 在 main 上有，但本地这棵树没有 —— 说出来，因为读者多半正准备去写它。
+    if [ $on_tree -ne 0 ]; then
+      echo "  ● 已在 $REF  $desc   ⚠️ 你这棵树上没有(落后于 $REF,先 rebase)"
+    else
+      echo "  ● 已在 $REF  $desc"
+    fi
+    return 0
+  fi
+  if [ $on_tree -eq 0 ]; then
+    echo "  ◐ 只在本地   $desc   (你这棵树上有,$REF 上还没有 —— 未合并)"
+    return 1
+  fi
+  echo "  ○ 未开工     $desc"
+  return 1
+}
+
+# 坐标。三处「它报的坐标不是它量的坐标」都在这里被回答：
+#   ① 手写表会静默过期            → 换成探针
+#   ② 打印 HEAD 却读工作树        → 脏树标记（下面 tree_coord）
+#   ③ 标签声称 main 却读当前树    → 探针改成真读 REF（见 probe）
+if ! git rev-parse --verify --quiet "$REF" >/dev/null; then
+  echo "⛔ 取不到 $REF —— 无法回答「这一刀在不在 main 上」。"
+  echo "   先 git fetch。**不把「取不到」当成「没有」**：那正是这个脚本"
+  echo "   存在所要防的那一类错误。"
+  exit 2
 fi
-echo "ME-3 状态（探针读的是 ${coord}）"
+ref_sha=$(git rev-parse --short "$REF")
+ref_age=$(git log -1 --format=%cr "$REF" 2>/dev/null || echo "?")
+tree_coord=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  tree_coord="${tree_coord}+未提交改动"
+fi
+echo "ME-3 状态"
+echo "  交付判据读的是 ${REF} = ${ref_sha}（最后一次 fetch：${ref_age}，不是此刻的远端）"
+echo "  你这棵树是 ${tree_coord}"
 echo
 
+# ⚠️ 未开工那几刀的符号是**预言**,不是读数。交付时若 API 用了别的名字,这一行
+# 会永远停在 ○ —— 那已经发生过一次:`3b-3 进程监督` 原本预言 `pub struct
+# Supervisor`,而 #171 交付的是 `RestartPolicy` + `terminate_group`,于是它在
+# supervise.rs 已经合进 main 之后仍报「未开工」。
+#
+# **所以交付一刀时,改这一行是交付的一部分**,和写测试一样 —— 不是事后整理。
 probe "3a   发现与安装"          rust/crates/agent24-os-packages/src/install.rs "pub fn install"
 probe "3b-1 framing"             rust/crates/agent24-os-proto/src/frame.rs       "pub fn read_frame"
 probe "3b-2a 版本协商"           rust/crates/agent24-os-proto/src/version.rs     "pub fn negotiate"
 probe "3b-2b initialize 线格式"  rust/crates/agent24-os-proto/src/initialize.rs  "pub fn accept"
 probe "3b-3 manifest spawn 字段" rust/crates/agent24-domain/src/lib.rs           "pub struct SpawnCommand"
 probe "3b-3 解析+起进程"         rust/crates/agent24-os-proto/src/launch.rs      "pub fn spawn"
-probe "3b-3 进程监督"            rust/crates/agent24-os-proto/src/supervise.rs   "pub struct Supervisor"
+probe "3b-3 进程监督"            rust/crates/agent24-os-proto/src/supervise.rs   "pub fn terminate_group"
 probe "3b-4 受约束代理"          rust/crates/agent24-os-proto/src/proxy.rs       "pub fn proxy_router"
 probe "3b-5 两阶段热 disable"    rust/crates/agent24-os-proto/src/drain.rs       "pub enum DrainState"
 probe "3c   回调通道其余部分"    rust/crates/agent24-os-proto/src/rpc.rs         "pub fn dispatch"
@@ -68,28 +123,33 @@ echo
 echo "--- 探针自证 ---"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 say() { [ "$1" = "$2" ] && echo "  ✓ $3" || echo "  ✗ 探针坏了:$3(得到 $2,应为 $1)"; }
+# 自证跑在临时文件上,而临时文件不可能在 REF 里 —— 所以自证用的是同一条 grep
+# 规则,不是同一个 probe。差别写出来:自证证的是**符号识别规则**,不是「读哪棵树」。
+tprobe() { # tprobe <文件> <符号> —— 只测识别规则
+  grep -qE "^[[:space:]]*$2\b" "$1" 2>/dev/null
+}
 
-probe "x" rust/crates/agent24-domain/src/lib.rs "pub struct DomainOsManifest" >/dev/null
+tprobe rust/crates/agent24-domain/src/lib.rs "pub struct DomainOsManifest"
 say 0 $? "已知存在的符号被探到"
 
-probe "x" rust/crates/agent24-domain/src/lib.rs "pub struct NoSuchSymbolEverXYZ" >/dev/null
+tprobe rust/crates/agent24-domain/src/lib.rs "pub struct NoSuchSymbolEverXYZ"
 say 1 $? "存在的文件里、不存在的符号 → 未开工"
 
 # 复审量出的两种形态,各一格。没有这两格,上面那两格挡不住它们:
 # 正对照查的是真符号,负对照查的是不存在的符号 —— 都没覆盖「文件在但是空壳」
 # 和「符号只在注释里」。
 printf '// TODO\n' > "$tmp/shell.rs"
-probe "x" "$tmp/shell.rs" "pub fn something" >/dev/null
+tprobe "$tmp/shell.rs" "pub fn something"
 say 1 $? "空壳文件(只有一行注释) → 未开工"
 
 printf '// TODO: 这里以后会有 pub fn something\n' > "$tmp/comment.rs"
-probe "x" "$tmp/comment.rs" "pub fn something" >/dev/null
+tprobe "$tmp/comment.rs" "pub fn something"
 say 1 $? "符号只出现在注释里 → 未开工"
 
 printf 'pub fn something() {}\n' > "$tmp/real.rs"
-probe "x" "$tmp/real.rs" "pub fn something" >/dev/null
+tprobe "$tmp/real.rs" "pub fn something"
 say 0 $? "同名符号真的定义了 → 已交付(证明上面两格不是靠「拒绝一切」通过的)"
 
 printf '    pub fn indented() {}\n' > "$tmp/indent.rs"
-probe "x" "$tmp/indent.rs" "pub fn indented" >/dev/null
+tprobe "$tmp/indent.rs" "pub fn indented"
 say 0 $? "缩进的定义仍被探到(行首锚定不等于必须顶格)"
