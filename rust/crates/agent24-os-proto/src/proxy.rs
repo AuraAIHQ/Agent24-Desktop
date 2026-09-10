@@ -1374,9 +1374,37 @@ mod tests {
     /// are reachable in milliseconds. A branch no test can reach and a branch
     /// that is wrong read the same from outside.
     fn proxy_with(upstream: SocketAddr, limits: Limits, inflight: usize) -> Router {
-        Router::new()
-            .fallback(proxy)
-            .with_state(state_with(NS, upstream, limits, inflight))
+        proxy_and_permits(upstream, limits, inflight).0
+    }
+
+    /// The same, plus the semaphore — so a test can wait until a permit has
+    /// actually been taken instead of sleeping and hoping.
+    fn proxy_and_permits(
+        upstream: SocketAddr,
+        limits: Limits,
+        inflight: usize,
+    ) -> (Router, Arc<tokio::sync::Semaphore>) {
+        let state = state_with(NS, upstream, limits, inflight);
+        let sem = state.inflight.clone();
+        (Router::new().fallback(proxy).with_state(state), sem)
+    }
+
+    /// Wait until the ceiling reads `want`, or fail saying so.
+    ///
+    /// Replaces a fixed `sleep` in two tests. A sleep does not ESTABLISH that
+    /// the first request took its permit — it only makes it likely, and on a
+    /// loaded CI box "likely" is how a test that is not about timing starts
+    /// failing about timing.
+    async fn wait_for_permits(sem: &tokio::sync::Semaphore, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while sem.available_permits() != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "permits stayed at {} instead of reaching {want}",
+                sem.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// A socket that accepts and then does exactly what the script says.
@@ -1551,20 +1579,21 @@ mod tests {
         // buffered body and the bound on the daemon's memory is the caller's
         // patience.
         let upstream = raw_upstream("silence").await;
-        let proxy = serve(proxy_with(
+        let (app, sem) = proxy_and_permits(
             upstream,
             Limits {
                 total: Duration::from_secs(5),
                 head: Duration::from_secs(2),
             },
             1,
-        ))
-        .await;
+        );
+        let proxy = serve(app).await;
 
         let first = tokio::spawn(async move {
             call(proxy, Method::GET, &format!("{NS}/wedged"), &[], "").await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Waited for as a FACT rather than assumed after a sleep.
+        wait_for_permits(&sem, 0).await;
         let refused = call(proxy, Method::GET, &format!("{NS}/second"), &[], "").await;
 
         // 503, not 502: the namespace cannot take this request right now, which
@@ -1679,17 +1708,15 @@ mod tests {
                 .with_state(hits.clone()),
         )
         .await;
-        let proxy = serve(proxy_with(
+        let (app, sem) = proxy_and_permits(
             upstream,
             Limits {
-                // Generous on purpose: the sleep below has to land INSIDE this
-                // window, and a 300ms window on a loaded CI box does not.
                 total: Duration::from_secs(2),
                 head: Duration::from_secs(10),
             },
             1,
-        ))
-        .await;
+        );
+        let proxy = serve(app).await;
 
         // Promise 50 bytes, send 3, stall.
         let mut stalled = tokio::net::TcpStream::connect(proxy).await.unwrap();
@@ -1702,7 +1729,7 @@ mod tests {
             .unwrap();
 
         // While it stalls, the one permit is taken.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        wait_for_permits(&sem, 0).await;
         let refused = call(proxy, Method::GET, &format!("{NS}/other"), &[], "").await;
         assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -1765,6 +1792,10 @@ mod tests {
         // 502. Refusing a legitimate response is a defect too.
         assert!(location_within(NS, NS, "?page=2"));
         assert!(location_within(NS, NS, "#section"));
+        assert!(
+            location_within(NS, NS, ""),
+            "the empty reference is the base"
+        );
         assert!(location_within(NS, "/api/v1/zzmock/things/1", "?page=2"));
         // Control: the path-bearing forms are still judged on the path.
         assert!(!location_within(NS, NS, "/api/v1/runs?page=2"));
@@ -1826,5 +1857,39 @@ mod tests {
             "the timeout named the wrong phase: {}",
             got.body
         );
+    }
+
+    #[tokio::test]
+    async fn the_timeout_names_the_deadline_that_actually_fired() {
+        // The head limit is 5s here and the TOTAL is 1s, so the total is what
+        // ends this — and the message has to say so. Reporting the head constant
+        // would claim "within 5.0s" about something that gave up after one, and
+        // a message naming the wrong limit sends the reader to the wrong knob.
+        //
+        // The existing head-timeout test could not catch that: it asserts the
+        // PHRASE, and the phrase is the same either way. Mutating only the
+        // NUMBER left it green — which is how a mutation can go red for the
+        // wrong reason and still look like coverage.
+        let upstream = raw_upstream("silence").await;
+        let proxy = serve(proxy_with(
+            upstream,
+            Limits {
+                total: Duration::from_secs(1),
+                head: Duration::from_secs(5),
+            },
+            8,
+        ))
+        .await;
+
+        let started = std::time::Instant::now();
+        let got = call(proxy, Method::GET, &format!("{NS}/anything"), &[], "").await;
+        assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            got.body.contains("1.0s"),
+            "the message named a limit that did not fire: {}",
+            got.body
+        );
+        assert!(!got.body.contains("5.0s"), "{}", got.body);
     }
 }
