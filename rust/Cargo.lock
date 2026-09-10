@@ -129,8 +129,10 @@ name = "agent24-os-proto"
 version = "0.3.0"
 dependencies = [
  "agent24-domain",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
